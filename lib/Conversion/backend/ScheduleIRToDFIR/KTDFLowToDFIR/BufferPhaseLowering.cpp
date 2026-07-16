@@ -164,8 +164,12 @@ mlir::LogicalResult processOneBufferPhasePair(
     return mlir::failure();
   }
 
-  auto select_op = mlir::dyn_cast<mlir::ktdf::SelectMemrefOp>(
-      *buffer_phase_op.getResult().getUsers().begin());
+  auto users = buffer_phase_op.getResult().getUsers();
+  if (!llvm::hasSingleElement(users)) {
+    buffer_phase_op.emitError("buffer_phase must have exactly one user");
+    return mlir::failure();
+  }
+  auto select_op = mlir::dyn_cast<mlir::ktdf::SelectMemrefOp>(*users.begin());
   if (!select_op) {
     buffer_phase_op.emitError(
         "buffer_phase's sole user must be a select_memref operation");
@@ -258,8 +262,9 @@ mlir::LogicalResult processOneBufferPhasePair(
   });
 
   if (!cloned_buffer_phase || !cloned_select) {
-    llvm::errs()
-        << "ERROR: Could not find cloned buffer_phase or select_memref\n";
+    cloned_outermost.emitError(
+        "could not find cloned buffer_phase or select_memref after loop "
+        "cloning");
     return mlir::failure();
   }
 
