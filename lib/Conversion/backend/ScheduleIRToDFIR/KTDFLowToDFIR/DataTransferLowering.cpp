@@ -35,38 +35,6 @@ using namespace scheduler;
 
 namespace {
 
-/// Helper to build IntegerSet from static size array
-/// Size of 1 corresponds to dk = 0, other sizes n correspond to 0 <= dk <= n-1
-mlir::IntegerSet buildIntegerSetFromSizes(mlir::MLIRContext* context,
-                                          llvm::ArrayRef<int64_t> sizes) {
-  if (sizes.empty()) {
-    return mlir::IntegerSet::getEmptySet(0, 0, context);
-  }
-
-  llvm::SmallVector<mlir::AffineExpr, 4> exprs;
-  llvm::SmallVector<bool, 4> eq_flags;
-
-  for (unsigned i = 0; i < sizes.size(); ++i) {
-    auto dim = mlir::getAffineDimExpr(i, context);
-    int64_t size = sizes[i];
-
-    if (size == 1) {
-      // Size 1: dk = 0
-      exprs.push_back(dim);
-      eq_flags.push_back(true);
-    } else {
-      // Size n: 0 <= dk <= n-1
-      // This means: dk >= 0 and dk <= n-1
-      exprs.push_back(dim);  // dk >= 0
-      eq_flags.push_back(false);
-      exprs.push_back(mlir::getAffineConstantExpr(size - 1, context) -
-                      dim);  // n-1 - dk >= 0
-      eq_flags.push_back(false);
-    }
-  }
-
-  return mlir::IntegerSet::get(sizes.size(), 0, exprs, eq_flags);
-}
 
 /// Create a vectorchain.shuffle that broadcasts src_vec (vector<src_elements x
 /// T>) to vector<dst_elements x T> using indices [0..src_elements-1] repeated
