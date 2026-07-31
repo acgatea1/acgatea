@@ -46,8 +46,10 @@
 
 #include <memory>
 
+#include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/Passes.h"
+#include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -78,17 +80,6 @@ static bool hasReductionIterator(linalg::GenericOp generic_op) {
   for (auto it : generic_op.getIteratorTypesArray())
     if (it == utils::IteratorType::reduction) return true;
   return false;
-}
-
-// ---------------------------------------------------------------------------
-// Extract the compute memory-space Attribute from `stage`'s applicable_units.
-// Falls back to StringAttr("SFU_REG") if the stage has no applicable units.
-// TODO: Fix hardcoding here
-// ---------------------------------------------------------------------------
-static Attribute getComputeMemSpace(ktdf::StageOp stage) {
-  if (auto units = stage.getApplicableUnits(); units && units->size() == 1)
-    return units->getValue().front();
-  return StringAttr::get(stage.getContext(), "SFU_REG");
 }
 
 // ---------------------------------------------------------------------------
@@ -212,23 +203,25 @@ static Value convertInputToMemref(OpBuilder& builder,
 // `generic_op` must have at least one reduction iterator and its input must
 // be a ktdf.read_from_fifo.
 // ---------------------------------------------------------------------------
-static void rewriteGeneric(linalg::GenericOp generic_op) {
-  // Walk up to the immediately enclosing ktdf.stage.
-  Operation* parent_op = generic_op->getParentOp();
-  while (parent_op && !isa<ktdf::StageOp>(parent_op))
-    parent_op = parent_op->getParentOp();
-  assert(parent_op);
-  auto stage = cast<ktdf::StageOp>(parent_op);
-
+static LogicalResult rewriteGeneric(
+    linalg::GenericOp generic_op,
+    scheduler::arch_view::ResourceKinds& resource_kinds) {
   // Step 1: create memref.alloc for the accumulator at the top of the stage
   // body.
   OpBuilder builder(generic_op);
   Location loc = generic_op.getLoc();
 
+  auto stage = generic_op->getParentOfType<ktdf::StageOp>();
+  assert(stage && "expected enclosing ktdf.stage");
   builder.setInsertionPointToStart(stage.getBody());
   auto out_tensor_type =
       cast<RankedTensorType>(generic_op.getDpsInitOperand(0)->get().getType());
-  Attribute mem_space = getComputeMemSpace(stage);
+  Attribute mem_space = resource_kinds.getComputeKind();
+  if (!mem_space) {
+    generic_op.emitError(
+        "No compute resource kind found in device description");
+    return failure();
+  }
   auto alloc_type = MemRefType::get(out_tensor_type.getShape(),
                                     out_tensor_type.getElementType(),
                                     MemRefLayoutAttrInterface{}, mem_space);
@@ -286,6 +279,7 @@ static void rewriteGeneric(linalg::GenericOp generic_op) {
 
   // Step 7: walk up the iter_arg chain and rebuild each scf.for without it.
   removeUnusedIterArgChain(acc_iter_arg, alloc.getResult());
+  return success();
 }
 
 struct MapReductionPartialsPass
@@ -298,12 +292,28 @@ struct MapReductionPartialsPass
     LDBG(1) << "========= " PASS_NAME " =========";
     ModuleOp module = getOperation();
 
+    auto& device_manager = getAnalysis<mlir::ktdf_arch::DeviceManager>();
+    auto* const device = device_manager.getOrImportDevice();
+    if (!device) {
+      module->emitError("Unable to import the device specification.");
+      signalPassFailure();
+      return;
+    }
+    auto& resource_kinds =
+        getChildAnalysis<scheduler::arch_view::ResourceKinds>(
+            device->getDeclaration());
+
     SmallVector<linalg::GenericOp> candidates;
     module.walk([&](linalg::GenericOp generic_op) {
       if (hasReductionIterator(generic_op)) candidates.push_back(generic_op);
     });
 
-    for (auto generic_op : candidates) rewriteGeneric(generic_op);
+    for (auto generic_op : candidates) {
+      if (failed(rewriteGeneric(generic_op, resource_kinds))) {
+        signalPassFailure();
+        return;
+      }
+    }
   }
 };
 
