@@ -169,29 +169,39 @@ struct ReductionLoopExposurePass
     linalg::GenericOp generic_op = findReductionGenericOp(compute_stage);
     if (!generic_op) return success();  // already removed?
 
-    // --- Determine reduction size R from the input tensor's reduction dim ---
-    int64_t reduction_dim = -1;
+    // --- Determine reduction size R from the input tensor's reduction dims ---
+    // Support multi-dimensional reductions by computing R as the product of all
+    // reduction dimension sizes.
+    SmallVector<int64_t> reduction_dims;
     auto iter_types = generic_op.getIteratorTypesArray();
     for (int64_t i = 0; i < static_cast<int64_t>(iter_types.size()); ++i)
       if (iter_types[i] == utils::IteratorType::reduction) {
-        reduction_dim = i;
-        break;
+        reduction_dims.push_back(i);
       }
-    if (reduction_dim < 0) {
+    if (reduction_dims.empty()) {
       compute_stage.emitError(PASS_NAME ": reduction dim not found");
       return failure();
     }
 
     auto input_type =
         cast<RankedTensorType>(generic_op.getInputs().front().getType());
-    int64_t reduction_size = input_type.getDimSize(reduction_dim);
-    if (reduction_size == ShapedType::kDynamic) {
-      LDBG(1) << PASS_NAME ": dynamic reduction size not supported — skipping";
-      return success();
+    int64_t reduction_size = 1;
+    for (int64_t reduction_dim : reduction_dims) {
+      int64_t dim_size = input_type.getDimSize(reduction_dim);
+      if (dim_size == ShapedType::kDynamic) {
+        LDBG(1) << PASS_NAME
+            ": dynamic reduction size not supported — skipping";
+        return success();
+      }
+      reduction_size *= dim_size;
     }
 
-    LDBG(1) << PASS_NAME ": reduction_dim=" << reduction_dim
-            << " reduction_size=" << reduction_size;
+    LDBG(1) << PASS_NAME ": reduction_dims=[";
+    for (size_t i = 0; i < reduction_dims.size(); ++i) {
+      if (i > 0) LDBG(1) << ", ";
+      LDBG(1) << reduction_dims[i];
+    }
+    LDBG(1) << "] reduction_size=" << reduction_size;
 
     // --- Get the parent pipeline ---
     auto inner_pipeline = compute_stage->getParentOfType<ktdf::PipelineOp>();
@@ -336,12 +346,15 @@ struct ReductionLoopExposurePass
         cast<RankedTensorType>(generic_op.getOutputs().front().getType());
 
     // Per-iteration input slice tensor: same shape as generic input but size-1
-    // in the reduction dim (e.g. 1x256x64 → 1x1x64).
+    // in all reduction dims (e.g. 1x256x64 → 1x1x64 for reduction dims [1]).
+    // For multi-dim reduction, all reduction dimensions become size-1.
     auto slice_tensor_type =
         cast<RankedTensorType>(generic_op.getInputs().front().getType());
     SmallVector<int64_t> slice_shape(slice_tensor_type.getShape().begin(),
                                      slice_tensor_type.getShape().end());
-    slice_shape[static_cast<size_t>(reduction_dim)] = 1;
+    for (int64_t reduction_dim : reduction_dims) {
+      slice_shape[static_cast<size_t>(reduction_dim)] = 1;
+    }
     auto one_row_tensor_type =
         RankedTensorType::get(slice_shape, slice_tensor_type.getElementType());
 
