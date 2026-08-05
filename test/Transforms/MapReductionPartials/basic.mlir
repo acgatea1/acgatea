@@ -65,7 +65,7 @@
 // CHECK-NEXT:                 }
 // CHECK-NEXT:               } {applicable_units = ["L1LU"]}
 // CHECK-NEXT:               ktdf.stage depends_in(%[[VAL_6:.*]]#2) depends_out(%[[VAL_6]]#3) {
-// CHECK-NEXT:                 %[[ALLOC_2:.*]] = memref.alloc() : memref<1x64xf16, "SFU">
+// CHECK-NEXT:                 %[[ALLOC_2:.*]] = memref.alloc() : memref<1x64xf16, "SFU_REG">
 // CHECK-NEXT:                 %[[CONSTANT_8:.*]] = arith.constant 0.000000e+00 : f16
 // CHECK-NEXT:                 linalg.fill ins(%[[CONSTANT_8]] : f16) outs(%[[ALLOC_2]] : memref<1x64xf16, "SFU">)
 // CHECK-NEXT:                 scf.for %[[VAL_7:.*]] = %[[CONSTANT_4]] to %[[CONSTANT_6]] step %[[CONSTANT_5]] {

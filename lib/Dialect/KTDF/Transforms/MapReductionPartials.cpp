@@ -46,7 +46,7 @@
 
 #include <memory>
 
-#include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
+#include "dataflow-scheduler/Analysis/ArchViews/GroupLocalMemory.h"
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/Passes.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
@@ -205,7 +205,7 @@ static Value convertInputToMemref(OpBuilder& builder,
 // ---------------------------------------------------------------------------
 static LogicalResult rewriteGeneric(
     linalg::GenericOp generic_op,
-    scheduler::arch_view::ResourceKinds& resource_kinds) {
+    scheduler::arch_view::GroupLocalMemory& group_local_mem) {
   // Step 1: create memref.alloc for the accumulator at the top of the stage
   // body.
   OpBuilder builder(generic_op);
@@ -216,10 +216,19 @@ static LogicalResult rewriteGeneric(
   builder.setInsertionPointToStart(stage.getBody());
   auto out_tensor_type =
       cast<RankedTensorType>(generic_op.getDpsInitOperand(0)->get().getType());
-  Attribute mem_space = resource_kinds.getComputeKind();
+
+  // Derive the local memory kind from the stage's exec_unit kind.
+  // applicable_units carries the exec_unit kind (e.g. "SFU"); the analysis
+  // maps that to the memory private to the same group (e.g. "SFU_REG").
+  Attribute mem_space;
+  if (const auto applicable_units = stage.getApplicableUnits();
+      applicable_units && applicable_units->size() == 1) {
+    Attribute exec_kind = applicable_units->getValue().front();
+    mem_space = group_local_mem.getLocalMemoryKind(exec_kind);
+  }
   if (!mem_space) {
     generic_op.emitError(
-        "No compute resource kind found in device description");
+        "No local memory found for compute unit in device description");
     return failure();
   }
   auto alloc_type = MemRefType::get(out_tensor_type.getShape(),
@@ -299,8 +308,8 @@ struct MapReductionPartialsPass
       signalPassFailure();
       return;
     }
-    auto& resource_kinds =
-        getChildAnalysis<scheduler::arch_view::ResourceKinds>(
+    auto& group_local_mem =
+        getChildAnalysis<scheduler::arch_view::GroupLocalMemory>(
             device->getDeclaration());
 
     SmallVector<linalg::GenericOp> candidates;
@@ -309,7 +318,7 @@ struct MapReductionPartialsPass
     });
 
     for (auto generic_op : candidates) {
-      if (failed(rewriteGeneric(generic_op, resource_kinds))) {
+      if (failed(rewriteGeneric(generic_op, group_local_mem))) {
         signalPassFailure();
         return;
       }
