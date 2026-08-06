@@ -149,9 +149,16 @@ struct LowerWriteToFifoPattern
     }
     mlir::Value queried_unit = *queried_unit_result;
 
+    // If the data operand is a memref buffer), load it into a vector first.
+    mlir::Value send_data = write_op.getData();
+    if (mlir::isa<mlir::MemRefType>(send_data.getType())) {
+      send_data =
+          emitVectorLoad(rewriter, write_op.getLoc(), vector_type, send_data);
+    }
+
     // Create dataflow.send operation
     mlir::dataflow::SendOp::create(rewriter, write_op.getLoc(), queried_unit,
-                                   write_op.getData(), /*dir=*/nullptr,
+                                   send_data, /*dir=*/nullptr,
                                    /*dbgName=*/nullptr);
 
     // Erase the write_to_fifo operation

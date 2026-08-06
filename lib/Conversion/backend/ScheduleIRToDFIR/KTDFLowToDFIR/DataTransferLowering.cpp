@@ -182,10 +182,6 @@ struct LowerDataTransferPattern
             "splat/pad transfer");
         return mlir::failure();
       }
-    } else if (src_total_elements != dst_total_elements) {
-      data_transfer_op.emitError(
-          "source and destination total elements must match");
-      return mlir::failure();
     }
 
     int64_t total_elements = dst_total_elements;
