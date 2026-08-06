@@ -16,14 +16,15 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// ReductionLoopExposure: expose the reduction dimension of a linalg.generic
-// inside a ktdf.pipeline as an explicit scf.for loop with a loop-carry
+// ReductionLoopExposure: expose the reduction dimension(s) of a linalg.generic
+// inside a ktdf.pipeline as explicit scf.for loops with a loop-carry
 // accumulator tensor.
 //
 // Algorithm:
 //   1. Walk the module for any ktdf.stage containing a linalg.generic with
 //      a reduction iterator — this is the compute stage.
-//   2. Derive R (reduction size) from the input tensor's reduction dimension.
+//   2. Collect reduction_dims[] and their per-dimension sizes dim_sizes[].
+//      The total shrink factor R = product(dim_sizes[]).
 //   3. Get the parent ktdf.pipeline of the compute stage.
 //   4. Find the load stage (upstream of compute via depends_in/depends_out
 //      token chain).  Assert the load stage has exactly one FIFO-dest
@@ -33,17 +34,21 @@
 //      the private body to match.
 //   6. Patch every data_transfer inside the pipeline whose source or
 //      destination is a shrunken FIFO: divide its static sizes by R.
-//   7. For every stage in the pipeline, wrap its entire body in
-//      scf.for %r = 0 to R step 1.
+//   7. For every stage in the pipeline, wrap its entire body in one nested
+//      scf.for loop per reduction dimension:
+//        scf.for %r0 = 0 to dim_sizes[0] step 1
+//          scf.for %r1 = 0 to dim_sizes[1] step 1
+//            ...
 //   8. For the compute stage specifically:
-//      - tensor.empty is emitted before the loop (accumulator init).
-//      - The loop carries the accumulator as iter_args.
-//      - The original linalg.generic is cloned inside the loop via IRMapping.
-//      - write_to_fifo is wrapped in scf.if (%r == R-1).
-//      - The loop is tagged {loop_type = reduction_loop}.
+//      - tensor.empty is emitted before the outermost loop (accumulator init).
+//      - Each loop level carries the accumulator as iter_args; the value
+//        threads down to the innermost loop where linalg.generic runs.
+//      - write_to_fifo is wrapped in scf.if (all ivs == last) in the
+//        innermost loop body.
+//      - The outermost loop is tagged {loop_type = reduction_loop}.
 //   9. Find the conditional-store stage (downstream of compute via
 //      depends_out/depends_in token chain).  Wrap its data_transfer in
-//      scf.if (%r == R-1) inside the already-created scf.for.
+//      scf.if (all ivs == last) inside the innermost already-created scf.for.
 //
 //===----------------------------------------------------------------------===//
 
@@ -85,7 +90,7 @@ namespace {
 // Return the first linalg.generic with a reduction iterator found anywhere
 // inside `stage`, or null if none exists.
 // ---------------------------------------------------------------------------
-static linalg::GenericOp findReductionGenericOp(ktdf::StageOp stage) {
+linalg::GenericOp findReductionGenericOp(ktdf::StageOp stage) {
   linalg::GenericOp found;
   stage.getBody()->walk([&](linalg::GenericOp generic) {
     for (auto it : generic.getIteratorTypesArray()) {
@@ -102,10 +107,138 @@ static linalg::GenericOp findReductionGenericOp(ktdf::StageOp stage) {
 // ---------------------------------------------------------------------------
 // Return true if `token` appears in the depends_in list of `stage`.
 // ---------------------------------------------------------------------------
-static bool stageConsumesToken(ktdf::StageOp stage, Value token) {
+bool stageConsumesToken(ktdf::StageOp stage, Value token) {
   for (Value dep : stage.getDependsIn())
     if (dep == token) return true;
   return false;
+}
+
+// ---------------------------------------------------------------------------
+// Build a nested scf.for structure with one loop per entry in `dim_sizes`.
+// Returns the innermost loop body's insertion point via `innermost_loop` and
+// a vector of all induction variables (outermost first).
+//
+// All loops are created inside `parent_block` at the current insertion point
+// of `rewriter`.  The outermost loop is tagged {loop_type = reduction_loop}
+// when `tag_outermost` is true.
+// ---------------------------------------------------------------------------
+struct NestedForResult {
+  scf::ForOp outermost_loop;
+  scf::ForOp innermost_loop;
+  SmallVector<Value> ivs;  // outermost first
+};
+
+NestedForResult buildNestedForLoops(OpBuilder& builder, Location loc,
+                                    MLIRContext* context,
+                                    ArrayRef<int64_t> dim_sizes, Value start,
+                                    Value step, bool tag_outermost,
+                                    ValueRange iter_args = {}) {
+  assert(!dim_sizes.empty() && "need at least one dimension");
+
+  NestedForResult result;
+  result.ivs.reserve(dim_sizes.size());
+
+  // Build upper-bound constants for each dimension.
+  SmallVector<Value> upper_bounds;
+  for (int64_t dim_sz : dim_sizes)
+    upper_bounds.push_back(
+        arith::ConstantIndexOp::create(builder, loc, dim_sz));
+
+  // We build the loops from outermost to innermost, using the body-builder
+  // callback so that each inner loop is created inside the outer loop.
+  // Because scf.ForOp::create with a builder callback invokes the callback
+  // immediately, we can recurse through the dimensions in one pass.
+  //
+  // To keep the logic flat (avoid actual C++ recursion), we use a lambda that
+  // captures a mutable state and is called iteratively via the builder chain.
+  // The outermost loop carries `iter_args`; each nesting level passes the
+  // iter_arg through as-is until the innermost level where the user code runs.
+
+  scf::ForOp outermost;
+  scf::ForOp innermost;
+  SmallVector<Value> collected_ivs;
+
+  // Recursive lambda (std::function for self-reference).
+  std::function<Value(OpBuilder&, Location, size_t, Value)> build_level =
+      [&](OpBuilder& loop_builder, Location loop_loc, size_t depth,
+          Value carry) -> Value {
+    bool is_outermost = (depth == 0);
+    bool is_innermost = (depth == dim_sizes.size() - 1);
+
+    // Use a SmallVector to avoid a dangling ValueRange pointing at a temporary.
+    SmallVector<Value> level_args_vec =
+        is_outermost
+            ? SmallVector<Value>(iter_args.begin(), iter_args.end())
+            : (carry ? SmallVector<Value>{carry} : SmallVector<Value>{});
+    ValueRange level_args(level_args_vec);
+
+    auto loop = scf::ForOp::create(
+        loop_builder, loop_loc, start, upper_bounds[depth], step, level_args,
+        [&](OpBuilder& body_builder, Location body_loc, Value iv,
+            ValueRange loop_iter_args) {
+          collected_ivs.push_back(iv);
+          (void)is_outermost;  // captured for level_args logic above
+
+          Value inner_carry =
+              loop_iter_args.empty() ? Value{} : loop_iter_args.front();
+
+          if (is_innermost) {
+            // Yield the carry unchanged; the caller will replace the yield.
+            if (inner_carry)
+              scf::YieldOp::create(body_builder, body_loc,
+                                   ValueRange{inner_carry});
+            else
+              scf::YieldOp::create(body_builder, body_loc, ValueRange{});
+          } else {
+            Value returned =
+                build_level(body_builder, body_loc, depth + 1, inner_carry);
+            if (returned)
+              scf::YieldOp::create(body_builder, body_loc,
+                                   ValueRange{returned});
+            else
+              scf::YieldOp::create(body_builder, body_loc, ValueRange{});
+          }
+        });
+
+    if (depth == 0) outermost = loop;
+    if (is_innermost) innermost = loop;
+    return loop.getResults().empty() ? Value{} : loop.getResult(0);
+  };
+
+  // Build a temporary placeholder carry if iter_args has an element so the
+  // lambda signature works.  The returned Value from the outermost level is
+  // the final result of the loop chain (unused outside — the caller sets up
+  // yield ops separately via the innermost loop body).
+  Value placeholder_carry = iter_args.empty() ? Value{} : iter_args.front();
+  OpBuilder root_builder = builder;
+  build_level(root_builder, loc, 0, placeholder_carry);
+
+  result.outermost_loop = outermost;
+  result.innermost_loop = innermost;
+  result.ivs = collected_ivs;
+
+  if (tag_outermost)
+    outermost->setAttr(
+        "loop_type",
+        ktdf::LoopTypeAttr::get(context, ktdf::LoopType::ReductionLoop));
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Build an i1 value that is true only when every iv[i] == last[i].
+// ---------------------------------------------------------------------------
+Value buildAllLast(OpBuilder& builder, Location loc, ArrayRef<Value> ivs,
+                   ArrayRef<Value> last_vals) {
+  assert(ivs.size() == last_vals.size());
+  Value cond = arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::eq,
+                                     ivs.front(), last_vals.front());
+  for (size_t i = 1; i < ivs.size(); ++i) {
+    Value cmp = arith::CmpIOp::create(builder, loc, arith::CmpIPredicate::eq,
+                                      ivs[i], last_vals[i]);
+    cond = arith::AndIOp::create(builder, loc, cond, cmp);
+  }
+  return cond;
 }
 
 // ---------------------------------------------------------------------------
@@ -169,15 +302,15 @@ struct ReductionLoopExposurePass
     linalg::GenericOp generic_op = findReductionGenericOp(compute_stage);
     if (!generic_op) return success();  // already removed?
 
-    // --- Determine reduction size R from the input tensor's reduction dims ---
-    // Support multi-dimensional reductions by computing R as the product of all
-    // reduction dimension sizes.
+    // --- Collect per-dimension reduction sizes ---
+    // Each reduction dimension gets its own scf.for loop.  The total shrink
+    // factor R = product(dim_sizes[]) is used only for FIFO resizing.
     SmallVector<int64_t> reduction_dims;
     auto iter_types = generic_op.getIteratorTypesArray();
     for (int64_t i = 0; i < static_cast<int64_t>(iter_types.size()); ++i)
-      if (iter_types[i] == utils::IteratorType::reduction) {
+      if (iter_types[i] == utils::IteratorType::reduction)
         reduction_dims.push_back(i);
-      }
+
     if (reduction_dims.empty()) {
       compute_stage.emitError(PASS_NAME ": reduction dim not found");
       return failure();
@@ -185,23 +318,26 @@ struct ReductionLoopExposurePass
 
     auto input_type =
         cast<RankedTensorType>(generic_op.getInputs().front().getType());
+
+    SmallVector<int64_t> dim_sizes;
     int64_t reduction_size = 1;
     for (int64_t reduction_dim : reduction_dims) {
-      int64_t dim_size = input_type.getDimSize(reduction_dim);
-      if (dim_size == ShapedType::kDynamic) {
+      int64_t dim_sz = input_type.getDimSize(reduction_dim);
+      if (dim_sz == ShapedType::kDynamic) {
         LDBG(1) << PASS_NAME
             ": dynamic reduction size not supported — skipping";
         return success();
       }
-      reduction_size *= dim_size;
+      dim_sizes.push_back(dim_sz);
+      reduction_size *= dim_sz;
     }
 
     LDBG(1) << PASS_NAME ": reduction_dims=[";
     for (size_t i = 0; i < reduction_dims.size(); ++i) {
       if (i > 0) LDBG(1) << ", ";
-      LDBG(1) << reduction_dims[i];
+      LDBG(1) << reduction_dims[i] << " (size=" << dim_sizes[i] << ")";
     }
-    LDBG(1) << "] reduction_size=" << reduction_size;
+    LDBG(1) << "] total_reduction_size=" << reduction_size;
 
     // --- Get the parent pipeline ---
     auto inner_pipeline = compute_stage->getParentOfType<ktdf::PipelineOp>();
@@ -217,15 +353,7 @@ struct ReductionLoopExposurePass
 
     // -----------------------------------------------------------------------
     // 1. Shrink ALL FIFO slots in ktdf.private whose element count is a
-    //    multiple of reduction_size.  Every FIFO in the inner pipeline that
-    //    carries R*C elements per iteration must become C elements so that
-    //    each loop iteration transfers exactly one slice.
-    //
-    //    We also locate fifo_in (written by the load stage) and fifo_out
-    //    (read by the compute stage's write_to_fifo) by tracing def-use:
-    //      fifo_in  — destination of the FIFO-dest data_transfer in the stage
-    //                 whose depends_out token matches compute_stage.depends_in
-    //      fifo_out — fifo_slot operand of the write_to_fifo in compute_stage
+    //    multiple of reduction_size (= product of all per-dim sizes).
     // -----------------------------------------------------------------------
     ktdf::PrivateOp priv_op = inner_pipeline.getPrivateOp();
     if (!priv_op) {
@@ -258,8 +386,8 @@ struct ReductionLoopExposurePass
     // From the load stage, find the data_transfer whose destination is a FIFO.
     // Assert that there is exactly one such transfer.
     SmallVector<ktdf::DataTransferOp> fifo_dest_transfers;
-    load_stage.getBody()->walk([&](ktdf::DataTransferOp dt) {
-      if (dt.isDestFifo()) fifo_dest_transfers.push_back(dt);
+    load_stage.getBody()->walk([&](ktdf::DataTransferOp xfer) {
+      if (xfer.isDestFifo()) fifo_dest_transfers.push_back(xfer);
     });
     if (fifo_dest_transfers.empty()) {
       inner_pipeline.emitError(PASS_NAME
@@ -285,18 +413,17 @@ struct ReductionLoopExposurePass
 
     // Build a map: original FifoSlotType → shrunken FifoSlotType for every
     // private result whose element count is divisible by reduction_size.
-    // This covers fifo_in and any other intermediate FIFOs in the pipeline.
     llvm::DenseMap<unsigned, ktdf::FifoSlotType> shrunken_fifo_map;
     SmallVector<Type> new_result_types(priv_op.getResultTypes());
     for (unsigned i = 0; i < priv_op.getNumResults(); ++i) {
       auto fifo_type =
           dyn_cast<ktdf::FifoSlotType>(priv_op.getResult(i).getType());
       if (!fifo_type) continue;
-      int64_t n = fifo_type.getNumElements();
-      if (n % reduction_size != 0) continue;
+      int64_t num_elems = fifo_type.getNumElements();
+      if (num_elems % reduction_size != 0) continue;
       auto shrunken = ktdf::FifoSlotType::get(
-          ctx, fifo_type.getSrc(), fifo_type.getDest(), n / reduction_size,
-          fifo_type.getElementType());
+          ctx, fifo_type.getSrc(), fifo_type.getDest(),
+          num_elems / reduction_size, fifo_type.getElementType());
       shrunken_fifo_map[i] = shrunken;
       new_result_types[i] = shrunken;
     }
@@ -332,8 +459,8 @@ struct ReductionLoopExposurePass
     // fifo_out: the fifo_slot operand of the write_to_fifo in compute_stage
     // (already updated to new_priv after RAUW above).
     Value fifo_out;
-    compute_stage.getBody()->walk([&](ktdf::WriteToFifoOp w) {
-      fifo_out = w.getFifoSlot();
+    compute_stage.getBody()->walk([&](ktdf::WriteToFifoOp write_op) {
+      fifo_out = write_op.getFifoSlot();
       return WalkResult::interrupt();
     });
     if (!fifo_out) {
@@ -345,66 +472,69 @@ struct ReductionLoopExposurePass
     auto output_tensor_type =
         cast<RankedTensorType>(generic_op.getOutputs().front().getType());
 
-    // Per-iteration input slice tensor: same shape as generic input but size-1
-    // in all reduction dims (e.g. 1x256x64 → 1x1x64 for reduction dims [1]).
-    // For multi-dim reduction, all reduction dimensions become size-1.
+    // Per-iteration input slice tensor: same shape as the generic input but
+    // size-1 in every reduction dimension.
+    // Example: input [1, 256, 64] with reduction dims [1] → slice [1, 1, 64].
+    // For non-contiguous reduction dims (e.g. [0, 2] of [d0, d1, d2]) both
+    // axes independently become 1, e.g. [1, d1, 1].
     auto slice_tensor_type =
         cast<RankedTensorType>(generic_op.getInputs().front().getType());
     SmallVector<int64_t> slice_shape(slice_tensor_type.getShape().begin(),
                                      slice_tensor_type.getShape().end());
-    for (int64_t reduction_dim : reduction_dims) {
+    for (int64_t reduction_dim : reduction_dims)
       slice_shape[static_cast<size_t>(reduction_dim)] = 1;
-    }
     auto one_row_tensor_type =
         RankedTensorType::get(slice_shape, slice_tensor_type.getElementType());
 
     // -----------------------------------------------------------------------
     // 1b. Patch data_transfer static sizes for any transfer that uses a
-    //     shrunken FIFO.  This applies to all stages (plain, compute, store).
-    //     For each data_transfer whose source or destination is now a shrunken
-    //     FIFO, divide the corresponding static sizes by reduction_size.
+    //     shrunken FIFO.
     // -----------------------------------------------------------------------
-    inner_pipeline->walk([&](ktdf::DataTransferOp dt) {
+    inner_pipeline->walk([&](ktdf::DataTransferOp xfer) {
       // Check if the destination FIFO was shrunken.
-      if (dt.isDestFifo()) {
-        auto fifo_res = dyn_cast<OpResult>(dt.getDestination());
+      if (xfer.isDestFifo()) {
+        auto fifo_res = dyn_cast<OpResult>(xfer.getDestination());
         if (fifo_res && fifo_res.getOwner() == new_priv &&
             shrunken_fifo_map.count(fifo_res.getResultNumber())) {
-          if (auto sizes = dt.getStaticDestSizes()) {
+          if (auto sizes = xfer.getStaticDestSizes()) {
             SmallVector<int64_t> new_sizes;
-            for (int64_t s : *sizes) new_sizes.push_back(s / reduction_size);
-            dt.setStaticDestSizesAttr(DenseI64ArrayAttr::get(ctx, new_sizes));
+            for (int64_t orig_sz : *sizes)
+              new_sizes.push_back(orig_sz / reduction_size);
+            xfer.setStaticDestSizesAttr(DenseI64ArrayAttr::get(ctx, new_sizes));
           }
         }
       }
       // Check if the source FIFO was shrunken.
-      if (dt.isSourceFifo()) {
-        auto fifo_res = dyn_cast<OpResult>(dt.getSource());
+      if (xfer.isSourceFifo()) {
+        auto fifo_res = dyn_cast<OpResult>(xfer.getSource());
         if (fifo_res && fifo_res.getOwner() == new_priv &&
             shrunken_fifo_map.count(fifo_res.getResultNumber())) {
-          if (auto sizes = dt.getStaticSourceSizes()) {
+          if (auto sizes = xfer.getStaticSourceSizes()) {
             SmallVector<int64_t> new_sizes;
-            for (int64_t s : *sizes) new_sizes.push_back(s / reduction_size);
-            dt.setStaticSourceSizesAttr(DenseI64ArrayAttr::get(ctx, new_sizes));
+            for (int64_t orig_sz : *sizes)
+              new_sizes.push_back(orig_sz / reduction_size);
+            xfer.setStaticSourceSizesAttr(
+                DenseI64ArrayAttr::get(ctx, new_sizes));
           }
         }
       }
     });
 
     // -----------------------------------------------------------------------
-    // 2. Build shared loop-bound constants before the inner pipeline.
+    // 2. Build shared constants before the inner pipeline.
     // -----------------------------------------------------------------------
     rewriter.setInsertionPoint(inner_pipeline);
-    Value c0 = arith::ConstantIndexOp::create(rewriter, loc, 0);
-    Value c1 = arith::ConstantIndexOp::create(rewriter, loc, 1);
-    Value c_red = arith::ConstantIndexOp::create(rewriter, loc, reduction_size);
-    Value c_last =
-        arith::ConstantIndexOp::create(rewriter, loc, reduction_size - 1);
+    Value start = arith::ConstantIndexOp::create(rewriter, loc, 0);
+    Value step = arith::ConstantIndexOp::create(rewriter, loc, 1);
+
+    // Per-dim "last index" constants (dim_size - 1).
+    SmallVector<Value> last_vals;
+    for (int64_t sz : dim_sizes)
+      last_vals.push_back(
+          arith::ConstantIndexOp::create(rewriter, loc, sz - 1));
 
     // -----------------------------------------------------------------------
-    // 3. Find the "conditional store" stage: the sibling stage whose
-    //    depends_in includes a token that the compute stage lists in
-    //    depends_out.  Its data_transfer must be guarded by scf.if (r==R-1).
+    // 3. Find the "conditional store" stage.
     // -----------------------------------------------------------------------
     ktdf::StageOp conditional_store_stage;
     for (Value tok : compute_stage.getDependsOut()) {
@@ -419,19 +549,18 @@ struct ReductionLoopExposurePass
     }
 
     // -----------------------------------------------------------------------
-    // 4. Rewrite every stage: wrap its body in scf.for %r = 0 to R step 1.
-    //    Extra surgery for the compute stage and the conditional store stage.
+    // 4. Rewrite every stage.
     // -----------------------------------------------------------------------
     for (auto stage : inner_pipeline.getStages()) {
       if (stage == compute_stage) {
         rewriteComputeStage(rewriter, loc, ctx, stage, generic_op,
                             one_row_tensor_type, output_tensor_type, fifo_in,
-                            fifo_out, c0, c1, c_red, c_last);
+                            fifo_out, dim_sizes, start, step, last_vals);
       } else if (stage == conditional_store_stage) {
-        rewriteConditionalStoreStage(rewriter, loc, stage, c0, c1, c_red,
-                                     c_last);
+        rewriteConditionalStoreStage(rewriter, loc, ctx, stage, dim_sizes,
+                                     start, step, last_vals);
       } else {
-        rewritePlainStage(rewriter, loc, stage, c0, c1, c_red);
+        rewritePlainStage(rewriter, loc, ctx, stage, dim_sizes, start, step);
       }
     }
 
@@ -440,40 +569,50 @@ struct ReductionLoopExposurePass
 
   // -------------------------------------------------------------------------
   // Wrap the entire body of a plain (non-compute, non-conditional) stage in
-  // scf.for %r = 0 to R.  All existing ops move into the loop body as-is.
+  // N nested scf.for loops, one per reduction dimension.  All existing ops
+  // move into the innermost loop body.
   // -------------------------------------------------------------------------
-  void rewritePlainStage(IRRewriter& rewriter, Location loc,
-                         ktdf::StageOp stage, Value c0, Value c1, Value c_red) {
+  void rewritePlainStage(IRRewriter& rewriter, Location loc, MLIRContext* ctx,
+                         ktdf::StageOp stage, ArrayRef<int64_t> dim_sizes,
+                         Value start, Value step) {
     Block* body = stage.getBody();
 
-    // Collect all existing ops (snapshot before insertion).
+    // Snapshot existing ops before we insert new ones.
     SmallVector<Operation*> ops;
     for (auto& op : *body) ops.push_back(&op);
 
     rewriter.setInsertionPointToStart(body);
-    auto red_for = scf::ForOp::create(rewriter, loc, c0, c_red, c1);
+    auto nested = buildNestedForLoops(rewriter, loc, ctx, dim_sizes, start,
+                                      step, /*tag_outermost=*/false);
 
-    // Move all original ops into the loop body, before the terminator.
-    Operation* loop_term = red_for.getBody()->getTerminator();
-    for (auto* op : ops) op->moveBefore(loop_term);
+    // Move all original ops into the innermost loop body, before its yield.
+    Operation* inner_term = nested.innermost_loop.getBody()->getTerminator();
+    for (auto* op : ops) op->moveBefore(inner_term);
   }
 
   // -------------------------------------------------------------------------
-  // Rewrite the compute stage:
-  //   %empty = tensor.empty()  : output_tensor_type          (before loop)
-  //   scf.for %r = 0 to R iter_args(%carry = %empty)
-  //       {loop_type = reduction_loop}
-  //     <all original body ops, but read_from_fifo gets new result type
-  //      and linalg.generic is recloned with updated operands>
-  //     if (%r == R-1): write_to_fifo %updated_carry, fifo_out
-  //     scf.yield %updated_carry
+  // Rewrite the compute stage with N nested scf.for loops (one per
+  // reduction dim), each carrying the accumulator tensor as iter_arg:
+  //
+  //   %empty = tensor.empty()                        (before outermost loop)
+  //   scf.for %r0 = 0 to D0 iter_args(%a0 = %empty)
+  //     {loop_type = reduction_loop}
+  //     scf.for %r1 = 0 to D1 iter_args(%a1 = %a0)
+  //       ...
+  //         read_from_fifo → %slice
+  //         linalg.generic(%slice, %aInner) → %updated
+  //         if (all ivs == last): write_to_fifo %updated, fifo_out
+  //         scf.yield %updated
+  //       ...
+  //     scf.yield %r1_result
+  //   scf.yield %r0_result
   // -------------------------------------------------------------------------
   void rewriteComputeStage(IRRewriter& rewriter, Location loc, MLIRContext* ctx,
                            ktdf::StageOp stage, linalg::GenericOp generic_op,
                            RankedTensorType one_row_tensor_type,
                            RankedTensorType output_tensor_type, Value fifo_in,
-                           Value fifo_out, Value c0, Value c1, Value c_red,
-                           Value c_last) {
+                           Value fifo_out, ArrayRef<int64_t> dim_sizes,
+                           Value start, Value step, ArrayRef<Value> last_vals) {
     Block* body = stage.getBody();
 
     // Collect existing ops to erase after the rewrite.
@@ -482,45 +621,51 @@ struct ReductionLoopExposurePass
 
     rewriter.setInsertionPointToStart(body);
 
-    // Accumulator initialiser — emitted once, outside the loop.
+    // Accumulator initialiser — emitted once, outside all loops.
     auto empty =
         tensor::EmptyOp::create(rewriter, loc, output_tensor_type.getShape(),
                                 output_tensor_type.getElementType());
 
-    // Build the reduction scf.for via the body-builder callback.
-    auto acc_for = scf::ForOp::create(
-        rewriter, loc, c0, c_red, c1, ValueRange{empty.getResult()},
-        [&](OpBuilder& b, Location l, Value iv, ValueRange iter_args) {
-          Value carry = iter_args.front();
+    // Build the nested loops, threading the accumulator through each level.
+    auto nested = buildNestedForLoops(
+        rewriter, loc, ctx, dim_sizes, start, step,
+        /*tag_outermost=*/true, ValueRange{empty.getResult()});
 
-          // read_from_fifo: one row at a time.
-          auto slice =
-              ktdf::ReadFromFifoOp::create(b, l, one_row_tensor_type, fifo_in);
+    // Now populate the innermost loop body (before its yield).
+    scf::ForOp innermost = nested.innermost_loop;
+    Block* inner_body = innermost.getBody();
+    Operation* inner_yield = inner_body->getTerminator();
 
-          // Clone the original linalg.generic, remapping its operands.
-          IRMapping mapping;
-          mapping.map(generic_op.getInputs().front(), slice.getResult());
-          mapping.map(generic_op.getOutputs().front(), carry);
-          auto new_generic = cast<linalg::GenericOp>(
-              b.clone(*generic_op.getOperation(), mapping));
-          Value updated_carry = new_generic.getResult(0);
+    OpBuilder body_builder = OpBuilder::atBlockBegin(inner_body);
+    body_builder.setInsertionPoint(inner_yield);
 
-          // On the last iteration, write the accumulated result to fifo_out.
-          Value is_last =
-              arith::CmpIOp::create(b, l, arith::CmpIPredicate::eq, iv, c_last);
-          auto if_op = scf::IfOp::create(b, l, TypeRange{}, is_last,
-                                         /*withElseRegion=*/false);
-          {
-            OpBuilder then_b =
-                OpBuilder::atBlockBegin(&if_op.getThenRegion().front());
-            ktdf::WriteToFifoOp::create(then_b, l, updated_carry, fifo_out);
-          }
+    // The iter_arg of the innermost loop is the accumulator carried in.
+    Value carry = innermost.getRegionIterArgs().front();
 
-          scf::YieldOp::create(b, l, ValueRange{updated_carry});
-        });
+    // read_from_fifo: one slice per innermost iteration.
+    auto slice = ktdf::ReadFromFifoOp::create(body_builder, loc,
+                                              one_row_tensor_type, fifo_in);
 
-    acc_for->setAttr("loop_type", ktdf::LoopTypeAttr::get(
-                                      ctx, ktdf::LoopType::ReductionLoop));
+    // Clone the original linalg.generic, remapping its operands.
+    IRMapping mapping;
+    mapping.map(generic_op.getInputs().front(), slice.getResult());
+    mapping.map(generic_op.getOutputs().front(), carry);
+    auto new_generic = cast<linalg::GenericOp>(
+        body_builder.clone(*generic_op.getOperation(), mapping));
+    Value updated_carry = new_generic.getResult(0);
+
+    // On the last iteration of all dimensions, write the accumulated result.
+    Value is_last = buildAllLast(body_builder, loc, nested.ivs, last_vals);
+    auto if_op = scf::IfOp::create(body_builder, loc, TypeRange{}, is_last,
+                                   /*withElseRegion=*/false);
+    {
+      OpBuilder then_builder =
+          OpBuilder::atBlockBegin(&if_op.getThenRegion().front());
+      ktdf::WriteToFifoOp::create(then_builder, loc, updated_carry, fifo_out);
+    }
+
+    // Replace the placeholder yield in the innermost loop with the real one.
+    inner_yield->setOperand(0, updated_carry);
 
     // Erase original body ops (reverse order, only if unused).
     for (auto* op : llvm::reverse(to_erase))
@@ -528,42 +673,44 @@ struct ReductionLoopExposurePass
   }
 
   // -------------------------------------------------------------------------
-  // Rewrite the conditional-store stage:
-  //   scf.for %r = 0 to R
-  //     <all original body ops except the data_transfer>
-  //     if (%r == R-1):
-  //       <the data_transfer>
+  // Rewrite the conditional-store stage with N nested scf.for loops:
+  //   scf.for %r0 = 0 to D0
+  //     scf.for %r1 = 0 to D1
+  //       ...
+  //         <all original body ops except the data_transfer>
+  //         if (all ivs == last):
+  //           <the data_transfer>
   // -------------------------------------------------------------------------
   void rewriteConditionalStoreStage(IRRewriter& rewriter, Location loc,
-                                    ktdf::StageOp stage, Value c0, Value c1,
-                                    Value c_red, Value c_last) {
+                                    MLIRContext* ctx, ktdf::StageOp stage,
+                                    ArrayRef<int64_t> dim_sizes, Value start,
+                                    Value step, ArrayRef<Value> last_vals) {
     Block* body = stage.getBody();
 
     // Find the data_transfer that must be conditioned.
     ktdf::DataTransferOp transfer;
-    body->walk([&](ktdf::DataTransferOp dt) {
-      transfer = dt;
+    body->walk([&](ktdf::DataTransferOp xfer) {
+      transfer = xfer;
       return WalkResult::interrupt();
     });
 
-    // Collect all existing ops.
+    // Snapshot all existing ops.
     SmallVector<Operation*> all_ops;
     for (auto& op : *body) all_ops.push_back(&op);
 
     rewriter.setInsertionPointToStart(body);
-    auto red_for = scf::ForOp::create(rewriter, loc, c0, c_red, c1);
-    Operation* loop_term = red_for.getBody()->getTerminator();
+    auto nested = buildNestedForLoops(rewriter, loc, ctx, dim_sizes, start,
+                                      step, /*tag_outermost=*/false);
+    Operation* inner_term = nested.innermost_loop.getBody()->getTerminator();
 
-    // Move all ops into the loop body.
-    for (auto* op : all_ops) op->moveBefore(loop_term);
+    // Move all ops into the innermost loop body.
+    for (auto* op : all_ops) op->moveBefore(inner_term);
 
     if (!transfer) return;  // no transfer found — nothing to guard
 
-    // Wrap just the data_transfer in scf.if (%r == R-1).
+    // Wrap just the data_transfer in scf.if (all ivs == last).
     rewriter.setInsertionPoint(transfer);
-    Value is_last =
-        arith::CmpIOp::create(rewriter, loc, arith::CmpIPredicate::eq,
-                              red_for.getInductionVar(), c_last);
+    Value is_last = buildAllLast(rewriter, loc, nested.ivs, last_vals);
     auto if_op = scf::IfOp::create(rewriter, loc, TypeRange{}, is_last,
                                    /*withElseRegion=*/false);
     // Move the transfer inside the then-block.
