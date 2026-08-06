@@ -118,9 +118,9 @@ llvm::SetVector<ResourceType> discoverAndPrune(mlir::func::FuncOp func) {
 }
 
 /// Phase 3a: resolve from_unit for each needed memory space inside a
-/// program_unit. Global spaces (DDR) are looked up directly from
-/// memory_unit_ssa. Per-core spaces (L1) get a uniform map + query emitted
-/// inside the body.
+/// program_unit. Global spaces (DDR) and below-scratchpad spaces (register
+/// files) are looked up directly from memory_unit_ssa at key -1. Per-core
+/// spaces (L1) get a uniform map + query emitted inside the body.
 mlir::LogicalResult buildResolvedUnits(
     mlir::dataflow::ProgramUnitOp pu,
     const llvm::SetVector<ResourceType>& needed_spaces,
@@ -131,13 +131,12 @@ mlir::LogicalResult buildResolvedUnits(
     mlir::OpBuilder& builder) {
   llvm::SetVector<ResourceType> per_core;
   for (auto ms : needed_spaces) {
-    if (memory_tree.isGlobalMemory(ms)) {
+    if (memory_tree.isGlobalMemory(ms) || memory_tree.isBelowScratchPad(ms)) {
       auto it = memory_unit_ssa.find({ms, -1});
       if (it == memory_unit_ssa.end())
         return pu.emitError("global memory unit SSA not found");
       resolved_units[ms] = it->second;
-    } else if (memory_tree.isPerCoreScratchPadMemory(ms) ||
-               memory_tree.isBelowScratchPad(ms)) {
+    } else if (memory_tree.isPerCoreScratchPadMemory(ms)) {
       per_core.insert(ms);
     }
   }

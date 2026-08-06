@@ -32,31 +32,22 @@ using namespace scheduler;
 using ResourceType = mlir::Attribute;
 
 // Lowercase unit-type tag for the emitted dataflow.get_unit `type`/`name`
-// strings and removes any "_reg" suffix (DFIR code generation requires
-// lowercase and has no register units). Compute resource tokens are lowercased
-// directly; Spyre memory-space attributes become their lowercased kind
-// ("l1"/"ddr"); any other attribute falls back to its lowercased printed form
-// so nothing is left uppercase.
+// strings (DFIR code generation requires lowercase). Compute resource tokens
+// are lowercased directly; Spyre memory-space attributes become their
+// lowercased kind ("l1"/"ddr"); any other attribute falls back to its
+// lowercased printed form so nothing is left uppercase.
 static std::string unitTypeTag(ResourceType rt) {
   if (auto ms = mlir::dyn_cast<mlir::ktdp::SpyreMemorySpaceAttr>(rt)) {
     return mlir::ktdp::stringifySpyreMemorySpaceKind(ms.getValue()).lower();
   }
-
-  auto stripRegSuffix = [](std::string s) -> std::string {
-    constexpr llvm::StringLiteral kSuffix = "_reg";
-    llvm::StringRef ref(s);
-    if (ref.ends_with(kSuffix)) return ref.drop_back(kSuffix.size()).str();
-    return s;
-  };
-
-  if (auto s = mlir::dyn_cast<mlir::StringAttr>(rt))
-    return stripRegSuffix(s.getValue().lower());
-
+  if (auto s = mlir::dyn_cast<mlir::StringAttr>(rt)) {
+    return s.getValue().lower();
+  }
   std::string printed;
   llvm::raw_string_ostream os(printed);
   rt.print(os);
   os.flush();
-  return stripRegSuffix(llvm::StringRef(printed).lower());
+  return llvm::StringRef(printed).lower();
 }
 
 mlir::LogicalResult UnitMaterializer::materialize(
@@ -147,8 +138,7 @@ mlir::LogicalResult UnitMaterializer::materializeMemoryUnits(
           type_tag);
       memory_unit_ssa[{mspace_attr, -1}] = get_unit_op.getUnit();
       LDBG(1) << "  Created global memory unit for " << space_name;
-    } else if (memory_tree.isPerCoreScratchPadMemory(mspace_attr) ||
-               memory_tree.isBelowScratchPad(mspace_attr)) {
+    } else if (memory_tree.isPerCoreScratchPadMemory(mspace_attr)) {
       for (int core = 0; core < grid_size; ++core) {
         auto unit_name = "C" + std::to_string(core) + "-" + type_tag;
         auto get_unit_op = mlir::dataflow::GetUnitOp::create(
@@ -159,6 +149,12 @@ mlir::LogicalResult UnitMaterializer::materializeMemoryUnits(
         LDBG(1) << "  Created memory unit for " << space_name << " core "
                 << core;
       }
+    } else if (memory_tree.isBelowScratchPad(mspace_attr)) {
+      auto get_unit_op = mlir::dataflow::GetUnitOp::create(
+          builder, loc, mlir::TypeRange{builder.getIndexType()}, type_tag,
+          type_tag);
+      memory_unit_ssa[{mspace_attr, -1}] = get_unit_op.getUnit();
+      LDBG(1) << "  Created below-scratchpad memory unit for " << space_name;
     } else {
       return func_.emitError("Unknown memory space classification for: ")
              << space_name;

@@ -35,7 +35,6 @@ using namespace scheduler;
 
 namespace {
 
-
 /// Create a vectorchain.shuffle that broadcasts src_vec (vector<src_elements x
 /// T>) to vector<dst_elements x T> using indices [0..src_elements-1] repeated
 /// (dst_elements / src_elements) times.
