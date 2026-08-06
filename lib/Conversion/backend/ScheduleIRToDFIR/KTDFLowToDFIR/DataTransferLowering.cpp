@@ -351,8 +351,10 @@ struct LowerDataTransferPattern
     }
 
     // Build src_load_set / dst_store_set from the per-vector sizes.
-    auto src_load_set = buildIntegerSetFromSizes(context, load_sizes);
-    auto dst_store_set = buildIntegerSetFromSizes(context, store_sizes);
+    auto src_load_set =
+        scheduler::buildIntegerSetFromSizes(context, load_sizes);
+    auto dst_store_set =
+        scheduler::buildIntegerSetFromSizes(context, store_sizes);
 
     // load_order and store_order must match their respective set
     // dimensionality.
@@ -366,7 +368,7 @@ struct LowerDataTransferPattern
     llvm::SmallVector<int64_t> time_extents = src_time_dims.extents;
     if (time_extents.empty()) time_extents.push_back(1);
     const unsigned num_time_dims = time_extents.size();
-    auto time_set = buildIntegerSetFromSizes(context, time_extents);
+    auto time_set = scheduler::buildIntegerSetFromSizes(context, time_extents);
     // time_order: identity. Correct because the walked dimensions above are
     // listed slowest-varying first, so time dimension 0 is already the
     // outermost and the last time dimension the innermost/fastest-varying.

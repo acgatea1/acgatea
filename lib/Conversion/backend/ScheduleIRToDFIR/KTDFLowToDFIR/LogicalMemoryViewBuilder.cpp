@@ -136,7 +136,8 @@ mlir::LogicalResult buildResolvedUnits(
       if (it == memory_unit_ssa.end())
         return pu.emitError("global memory unit SSA not found");
       resolved_units[ms] = it->second;
-    } else if (memory_tree.isPerCoreScratchPadMemory(ms)) {
+    } else if (memory_tree.isPerCoreScratchPadMemory(ms) ||
+               memory_tree.isBelowScratchPad(ms)) {
       per_core.insert(ms);
     }
   }
@@ -388,7 +389,8 @@ mlir::LogicalResult replaceSourceBCasts(
 /// propagate plain-memref types through select_memref and data_transfer.
 mlir::LogicalResult propagateTypes(
     mlir::dataflow::ProgramUnitOp pu,
-    const llvm::DenseMap<mlir::Value, mlir::Value>& replacements) {
+    const llvm::DenseMap<mlir::Value, mlir::Value>& replacements,
+    const scheduler::arch_view::MemoryTree& memory_tree) {
   for (auto& [old_val, new_val] : replacements) {
     llvm::SmallVector<mlir::Operation*> users(old_val.getUsers().begin(),
                                               old_val.getUsers().end());
@@ -408,9 +410,17 @@ mlir::LogicalResult propagateTypes(
                 "data_transfer");
         }
       } else {
-        return pu.emitError(
-            "unexpected consumer of memory view; expected "
-            "data_transfer or select_memref");
+        // Sub-scratchpad spaces (e.g. SFU_REG) are register-file buffers
+        // consumed directly by compute ops (linalg.*, write_to_fifo, …).
+        // Any consumer is valid; just swap the operand.
+        auto ms = getMemorySpaceAttr(old_val.getType());
+        if (ms && memory_tree.isBelowScratchPad(*ms)) {
+          user->replaceUsesOfWith(old_val, new_val);
+        } else {
+          return pu.emitError(
+              "unexpected consumer of memory view; expected "
+              "data_transfer or select_memref");
+        }
       }
     }
   }
@@ -488,7 +498,8 @@ mlir::LogicalResult scheduler::buildLogicalMemoryViews(
       return mlir::failure();
 
     // Phase 3d: RAUW + type propagation.
-    if (mlir::failed(propagateTypes(pu, replacements))) return mlir::failure();
+    if (mlir::failed(propagateTypes(pu, replacements, memory_tree)))
+      return mlir::failure();
 
     // Erase original Source A chain ops and Source B casts (now dead).
     for (auto& [old_val, new_val] : replacements) {
