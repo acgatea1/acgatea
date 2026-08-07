@@ -559,6 +559,9 @@ struct ReductionLoopExposurePass
       } else if (stage == conditional_store_stage) {
         rewriteConditionalStoreStage(rewriter, loc, ctx, stage, dim_sizes,
                                      start, step, last_vals);
+      } else if (stage == load_stage) {
+        rewriteLoadStage(rewriter, loc, ctx, stage, dim_sizes, start, step,
+                         reduction_dims, slice_tensor_type.getRank());
       } else {
         rewritePlainStage(rewriter, loc, ctx, stage, dim_sizes, start, step);
       }
@@ -571,10 +574,12 @@ struct ReductionLoopExposurePass
   // Wrap the entire body of a plain (non-compute, non-conditional) stage in
   // N nested scf.for loops, one per reduction dimension.  All existing ops
   // move into the innermost loop body.
+  // Returns the NestedForResult so callers have access to their IVs if needed.
   // -------------------------------------------------------------------------
-  void rewritePlainStage(IRRewriter& rewriter, Location loc, MLIRContext* ctx,
-                         ktdf::StageOp stage, ArrayRef<int64_t> dim_sizes,
-                         Value start, Value step) {
+  NestedForResult rewritePlainStage(IRRewriter& rewriter, Location loc,
+                                    MLIRContext* ctx, ktdf::StageOp stage,
+                                    ArrayRef<int64_t> dim_sizes, Value start,
+                                    Value step) {
     Block* body = stage.getBody();
 
     // Snapshot existing ops before we insert new ones.
@@ -588,6 +593,79 @@ struct ReductionLoopExposurePass
     // Move all original ops into the innermost loop body, before its yield.
     Operation* inner_term = nested.innermost_loop.getBody()->getTerminator();
     for (auto* op : ops) op->moveBefore(inner_term);
+
+    return nested;
+  }
+
+  // -------------------------------------------------------------------------
+  // Rewrite the load stage like rewritePlainStage, then for each reduction
+  // dimension i set source_sizes[reduction_dim_i] = 1 and substitute
+  // source_map result[reduction_dim_i] with the corresponding loop IV.
+  //
+  // Example (reduction_dim=1 in a 1x256x64 tensor, source memref 2x1x256x64):
+  //   before: data_transfer from %src[%b, 0, 0, 0] size [1, 1, 256, 64]
+  //                          to %fifo size [16384]
+  //   after:  scf.for %r = 0 to 256 {
+  //             data_transfer from %src[%b, 0, %r, 0] size [1, 1, 1, 64]
+  //                            to %fifo size [64]
+  //           }
+  // -------------------------------------------------------------------------
+  void rewriteLoadStage(IRRewriter& rewriter, Location loc, MLIRContext* ctx,
+                        ktdf::StageOp stage, ArrayRef<int64_t> dim_sizes,
+                        Value start, Value step,
+                        ArrayRef<int64_t> reduction_dims, int64_t tensor_rank) {
+    auto nested =
+        rewritePlainStage(rewriter, loc, ctx, stage, dim_sizes, start, step);
+
+    // nested.ivs[i] is the IV corresponding to reduction_dims[i].
+    nested.innermost_loop.getBody()->walk([&](ktdf::DataTransferOp dt) {
+      if (!dt.isDestFifo()) return;
+
+      auto sizes_attr = dt.getStaticSourceSizes();
+      if (!sizes_attr) return;
+      int64_t memref_rank = static_cast<int64_t>(sizes_attr->size());
+      // Stage coarsening may have introduced extra leading dimensions into the
+      // source memref (to express additional granularity), so the reduction
+      // dimensions sit at an offset from the right relative to the linalg
+      // tensor rank.
+      int64_t rank_offset = memref_rank - tensor_rank;
+
+      // --- 1. Set size to 1 at each memref reduction dimension ---
+      SmallVector<int64_t> new_sizes(sizes_attr->begin(), sizes_attr->end());
+      for (size_t i = 0; i < reduction_dims.size(); ++i) {
+        unsigned d = static_cast<unsigned>(reduction_dims[i] + rank_offset);
+        if (d < new_sizes.size()) new_sizes[d] = 1;
+      }
+      dt.setStaticSourceSizesAttr(DenseI64ArrayAttr::get(ctx, new_sizes));
+
+      // --- 2. Rewrite source_map + source_indices ---
+      // The source indices are AffineMap operands, not a flat per-dimension
+      // list — constant indices live inside the map as affine constants.
+      // Append one new dim per reduction dim and replace the corresponding
+      // map result.  Result count (= memref rank) is unchanged.
+      std::optional<AffineMap> maybe_map = dt.getSourceMap();
+      if (!maybe_map) return;
+      AffineMap map = *maybe_map;
+
+      unsigned base_iv_dim = map.getNumDims();
+      SmallVector<AffineExpr> new_results(map.getResults().begin(),
+                                          map.getResults().end());
+      SmallVector<Value> new_indices(dt.getSourceIndices().begin(),
+                                     dt.getSourceIndices().end());
+      for (size_t i = 0; i < reduction_dims.size(); ++i) {
+        unsigned d = static_cast<unsigned>(reduction_dims[i] + rank_offset);
+        if (d < new_results.size()) {
+          new_results[d] = getAffineDimExpr(base_iv_dim + i, ctx);
+          new_indices.push_back(nested.ivs[i]);
+        }
+      }
+
+      AffineMap new_map = AffineMap::get(
+          base_iv_dim + static_cast<unsigned>(reduction_dims.size()),
+          map.getNumSymbols(), new_results, ctx);
+      dt.setSourceMapAttr(AffineMapAttr::get(new_map));
+      dt.getSourceIndicesMutable().assign(new_indices);
+    });
   }
 
   // -------------------------------------------------------------------------

@@ -70,7 +70,7 @@
 // CHECK:                       scf.for %[[VAL_5:.*]] = %[[CONSTANT_4]] to %[[CONSTANT_7]] step %[[CONSTANT_5]] {
 // CHECK:                         %[[SUBI_1:.*]] = arith.subi %[[VAL_3]], %[[CONSTANT_0]] : index
 // CHECK:                         %[[DIVSI_1:.*]] = arith.divsi %[[SUBI_1]], %[[CONSTANT_1]] : index
-// CHECK:                         ktdf.data_transfer from %[[VAL_2]]#0{{\[}}%[[DIVSI_1]], 0, 0, 0] size [1, 1, 256, 64] to %[[VAL_4]]#0 size [64] : memref<2x1x256x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
+// CHECK:                         ktdf.data_transfer from %[[VAL_2]]#0{{\[}}%[[DIVSI_1]], 0, %[[VAL_5]], 0] size [1, 1, 1, 64] to %[[VAL_4]]#0 size [64] : memref<2x1x256x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
 // CHECK:                       }
 // CHECK:                     } {applicable_units = ["L1LU"]}
 // CHECK:                     ktdf.stage depends_in(%[[VAL_6:.*]]#2) depends_out(%[[VAL_6]]#3) {

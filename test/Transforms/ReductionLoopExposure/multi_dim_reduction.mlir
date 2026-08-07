@@ -69,7 +69,7 @@
 // CHECK:                       %[[CONSTANT_9:.*]] = arith.constant 256 : index
 // CHECK:                       scf.for %[[VAL_5:.*]] = %[[CONSTANT_4]] to %[[CONSTANT_8]] step %[[CONSTANT_5]] {
 // CHECK:                         scf.for %[[VAL_6:.*]] = %[[CONSTANT_4]] to %[[CONSTANT_9]] step %[[CONSTANT_5]] {
-// CHECK:                           ktdf.data_transfer from %[[VAL_2]]#0{{\[}}%[[VAL_3]], 0, 0, 0] size [1, 2, 256, 64] to %[[VAL_4]]#0 size [64] : memref<2x2x256x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
+// CHECK:                           ktdf.data_transfer from %[[VAL_2]]#0{{\[}}%[[VAL_3]], %[[VAL_5]], %[[VAL_6]], 0] size [1, 1, 1, 64] to %[[VAL_4]]#0 size [64] : memref<2x2x256x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
 // CHECK:                         }
 // CHECK:                       }
 // CHECK:                     } {applicable_units = ["L1LU"]}
