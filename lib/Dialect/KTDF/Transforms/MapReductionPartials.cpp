@@ -180,8 +180,7 @@ static void removeUnusedIterArgChain(BlockArgument acc_iter_arg,
 // defined by a ktdf.read_from_fifo — no other producer is supported.
 // ---------------------------------------------------------------------------
 static Value convertInputToMemref(OpBuilder& builder,
-                                  linalg::GenericOp generic_op,
-                                  Attribute mem_space) {
+                                  linalg::GenericOp generic_op) {
   assert(generic_op.getInputs().size() == 1 &&
          "convertInputToMemref: expected exactly one input on linalg.generic");
   Value input = generic_op.getInputs()[0];
@@ -191,8 +190,7 @@ static Value convertInputToMemref(OpBuilder& builder,
 
   auto in_tensor_type = cast<RankedTensorType>(input.getType());
   auto in_memref_type = MemRefType::get(in_tensor_type.getShape(),
-                                        in_tensor_type.getElementType(),
-                                        MemRefLayoutAttrInterface{}, mem_space);
+                                        in_tensor_type.getElementType());
   return ktdf::ReadFromFifoOp::create(builder, generic_op.getLoc(),
                                       in_memref_type, orig_read.getFifoSlot())
       .getResult();
@@ -247,7 +245,7 @@ static LogicalResult rewriteGeneric(
   // Step 3: emit a new ktdf.read_from_fifo with a memref result type so the
   // buffer-semantics linalg.generic below has a pure-buffer input.
   builder.setInsertionPoint(generic_op);
-  Value new_read = convertInputToMemref(builder, generic_op, mem_space);
+  Value new_read = convertInputToMemref(builder, generic_op);
 
   // Step 4: pure-buffer linalg.generic — memref ins + memref outs, no result.
   auto buf_generic = linalg::GenericOp::create(
