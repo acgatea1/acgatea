@@ -3,5 +3,4 @@
 	url = https://github.com/torch-spyre/ktir-mlir-frontend.git
 [submodule "external/dataflow-scheduler-dialects"]
 	path = external/dataflow-scheduler-dialects
-	url = https://github.com/bmahjour/dataflow-scheduler-mlir-dialects.git
-	branch = bmahjour/fifo-memref
+	url = https://github.com/torch-spyre/dataflow-scheduler-mlir-dialects.git
