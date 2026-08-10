@@ -8,13 +8,13 @@
 // CHECK-LABEL: func.func @fill_zero_memref
 // CHECK:         dataflow.program_unit
 // CHECK:           %[[BS:.+]] = vectorchain.constant_bitstream {value = [0x0]} : vector<1xf16>
-// CHECK-NEXT:      %[[SH:.+]] = vectorchain.shuffle %[[BS]] {indices = [0 : i32], repetition = 64 : i32} : vector<1xf16>, vector<64xf16>
+// CHECK-NEXT:      %[[SH:.+]] = vectorchain.shuffle input(%[[BS]]) {indices = [0 : i32], repetition = 64 : i32} : vector<1xf16>, vector<64xf16>
 // CHECK-NEXT:      agen.vector_store %[[SH]]
 
 // ---- tensor case ----
 // CHECK-LABEL: func.func @fill_zero_tensor
 // CHECK:           %[[BS2:.+]] = vectorchain.constant_bitstream {value = [0x0]} : vector<1xf16>
-// CHECK-NEXT:      %[[SH2:.+]] = vectorchain.shuffle %[[BS2]] {indices = [0 : i32], repetition = 64 : i32} : vector<1xf16>, vector<64xf16>
+// CHECK-NEXT:      %[[SH2:.+]] = vectorchain.shuffle input(%[[BS2]]) {indices = [0 : i32], repetition = 64 : i32} : vector<1xf16>, vector<64xf16>
 // CHECK-NOT:       agen.vector_store
 
 module {

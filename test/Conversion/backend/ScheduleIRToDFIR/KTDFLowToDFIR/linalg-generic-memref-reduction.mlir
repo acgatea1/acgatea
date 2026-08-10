@@ -27,7 +27,7 @@
 // CHECK-NEXT:     dataflow.program_unit iter_arg : %[[VAL_2:.*]] -> (%[[GET_UNIT_2]], %[[GET_UNIT_3]]) : {
 // CHECK-NEXT:       %[[ALLOC_1:.*]] = memref.alloc() : memref<1x64xf16, "SFU_REG">
 // CHECK-NEXT:       %[[CONSTANT_BITSTREAM_0:.*]] = vectorchain.constant_bitstream {value = [0x0]} : vector<1xf16>
-// CHECK-NEXT:       %[[SHUFFLE_0:.*]] = vectorchain.shuffle %[[CONSTANT_BITSTREAM_0]] {indices = [0 : i32], repetition = 64 : i32} : vector<1xf16>, vector<64xf16>
+// CHECK-NEXT:       %[[SHUFFLE_0:.*]] = vectorchain.shuffle input(%[[CONSTANT_BITSTREAM_0]]) {indices = [0 : i32], repetition = 64 : i32} : vector<1xf16>, vector<64xf16>
 // CHECK-NEXT:       agen.vector_store %[[SHUFFLE_0]], %[[ALLOC_1]]{{\[}}%[[CONSTANT_2]], %[[CONSTANT_2]]] {store_order = #[[$ATTR_1]], store_set = #[[$ATTR_4]]} : memref<1x64xf16, "SFU_REG">, vector<64xf16>
 // CHECK-NEXT:       scf.for %[[VAL_3:.*]] = %[[CONSTANT_2]] to %[[CONSTANT_0]] step %[[CONSTANT_1]] {
 // CHECK-NEXT:         %[[DEF_IMMUTABLE_MAPPING_1:.*]] = uniform.def_immutable_mapping({{\[}}%[[GET_UNIT_2]] -> %[[GET_UNIT_0]]], {{\[}}%[[GET_UNIT_3]] -> %[[GET_UNIT_1]]]):index
