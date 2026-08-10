@@ -1,5 +1,4 @@
-//===-- GroupLocalMemory.h ----------------------------------------------*- c++
-//-*-===//
+//===-- GroupLocalMemory.h --------------------------------------*- c++ -*-===//
 //
 // Part of the Dataflow Scheduler project.
 //
