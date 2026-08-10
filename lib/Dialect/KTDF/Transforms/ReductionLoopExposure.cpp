@@ -114,6 +114,185 @@ bool stageConsumesToken(ktdf::StageOp stage, Value token) {
 }
 
 // ---------------------------------------------------------------------------
+// Locate the unique FIFO-dest data_transfer in `load_stage` and validate that
+// its destination is a result of `priv_op`.  On success writes the result
+// index into `fifo_in_idx` and returns true.  Returns false and emits a
+// diagnostic on any violation:
+//   - no FIFO-dest transfer found
+//   - more than one FIFO-dest transfer found
+//   - destination is not a ktdf.private result
+// ---------------------------------------------------------------------------
+static bool resolveFifoInIndex(ktdf::StageOp load_stage,
+                               ktdf::PrivateOp priv_op, unsigned& fifo_in_idx) {
+  SmallVector<ktdf::DataTransferOp> fifo_dest_transfers;
+  load_stage.getBody()->walk([&](ktdf::DataTransferOp xfer) {
+    if (xfer.isDestFifo()) fifo_dest_transfers.push_back(xfer);
+  });
+  if (fifo_dest_transfers.empty()) {
+    load_stage.emitError(PASS_NAME
+                         ": no FIFO-dest data_transfer in load stage");
+    return false;
+  }
+  if (fifo_dest_transfers.size() > 1) {
+    load_stage.emitError(PASS_NAME
+                         ": multiple FIFO-dest data_transfers in load stage"
+                         " — not supported");
+    return false;
+  }
+
+  Value dest = fifo_dest_transfers.front().getDestination();
+  auto dest_result = dyn_cast<OpResult>(dest);
+  if (!dest_result || dest_result.getOwner() != priv_op) {
+    load_stage.emitError(PASS_NAME ": fifo_in is not a ktdf.private result");
+    return false;
+  }
+
+  fifo_in_idx = dest_result.getResultNumber();
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Carry the result of per-dimension reduction analysis.
+// ---------------------------------------------------------------------------
+struct ReductionInfo {
+  SmallVector<int64_t> reduction_dims;  // indices into iterator-type list
+  SmallVector<int64_t> dim_sizes;       // size of each reduction dimension
+  int64_t reduction_size = 1;           // product of dim_sizes
+};
+
+// ---------------------------------------------------------------------------
+// Fill `info` with the reduction dimensions and sizes derived from
+// `generic_op`.  Returns true on success.  Returns false (and emits a
+// diagnostic or debug message) when:
+//   - there are no reduction dimensions, or
+//   - any reduction dimension has a dynamic size.
+// ---------------------------------------------------------------------------
+static bool collectReductionInfo(linalg::GenericOp generic_op,
+                                 ReductionInfo& info) {
+  auto iter_types = generic_op.getIteratorTypesArray();
+  for (int64_t i = 0; i < static_cast<int64_t>(iter_types.size()); ++i)
+    if (iter_types[i] == utils::IteratorType::reduction)
+      info.reduction_dims.push_back(i);
+
+  if (info.reduction_dims.empty()) {
+    generic_op.emitError(PASS_NAME ": reduction dim not found");
+    return false;
+  }
+
+  auto input_type =
+      cast<RankedTensorType>(generic_op.getInputs().front().getType());
+
+  for (int64_t reduction_dim : info.reduction_dims) {
+    int64_t dim_sz = input_type.getDimSize(reduction_dim);
+    if (dim_sz == ShapedType::kDynamic) {
+      LDBG(1) << PASS_NAME ": dynamic reduction size not supported — skipping";
+      return false;
+    }
+    info.dim_sizes.push_back(dim_sz);
+    info.reduction_size *= dim_sz;
+  }
+
+  LDBG(1) << PASS_NAME ": reduction_dims=[";
+  for (size_t i = 0; i < info.reduction_dims.size(); ++i) {
+    if (i > 0) LDBG(1) << ", ";
+    LDBG(1) << info.reduction_dims[i] << " (size=" << info.dim_sizes[i] << ")";
+  }
+  LDBG(1) << "] total_reduction_size=" << info.reduction_size;
+
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Replace `priv_op` with a new ktdf.private whose FIFO slots are divided by
+// `reduction_size` (skipping slots whose element count is not a multiple of
+// `reduction_size`).  Patches
+// every fifo.allocate inside the new body to match.
+//
+// On success returns the replacement PrivateOp and fills `shrunken_fifo_map`
+// (result-index → new FifoSlotType).  Returns failure() and emits a
+// diagnostic when no slot is divisible.
+// ---------------------------------------------------------------------------
+static FailureOr<ktdf::PrivateOp> shrinkPrivateFifoSlots(
+    IRRewriter& rewriter, Location loc, MLIRContext* ctx,
+    ktdf::PrivateOp priv_op, int64_t reduction_size,
+    llvm::DenseMap<unsigned, ktdf::FifoSlotType>& shrunken_fifo_map) {
+  SmallVector<Type> new_result_types(priv_op.getResultTypes());
+  for (unsigned i = 0; i < priv_op.getNumResults(); ++i) {
+    auto fifo_type =
+        dyn_cast<ktdf::FifoSlotType>(priv_op.getResult(i).getType());
+    if (!fifo_type) continue;
+    int64_t num_elems = fifo_type.getNumElements();
+    if (num_elems % reduction_size != 0) continue;
+    auto shrunken = ktdf::FifoSlotType::get(
+        ctx, fifo_type.getSrc(), fifo_type.getDest(),
+        num_elems / reduction_size, fifo_type.getElementType());
+    shrunken_fifo_map[i] = shrunken;
+    new_result_types[i] = shrunken;
+  }
+  if (shrunken_fifo_map.empty()) {
+    priv_op.emitError(PASS_NAME ": no FIFO slots divisible by reduction_size");
+    return failure();
+  }
+
+  rewriter.setInsertionPoint(priv_op);
+  auto new_priv = ktdf::PrivateOp::create(rewriter, loc, new_result_types);
+  rewriter.mergeBlocks(&priv_op.getRegion().front(),
+                       &new_priv.getRegion().front(), {});
+
+  // Patch every fifo.allocate inside the new body to use the shrunken type.
+  new_priv.getRegion().front().walk([&](ktdf::FifoAllocateOp alloc) {
+    for (auto& [idx, shrunken] : shrunken_fifo_map) {
+      auto orig_type =
+          dyn_cast<ktdf::FifoSlotType>(priv_op.getResult(idx).getType());
+      if (orig_type && alloc.getResult(0).getType() == orig_type)
+        alloc.getResult(0).setType(shrunken);
+    }
+  });
+
+  for (auto [old_res, new_res] :
+       llvm::zip(priv_op.getResults(), new_priv.getResults()))
+    old_res.replaceAllUsesWith(new_res);
+  rewriter.eraseOp(priv_op);
+
+  return new_priv;
+}
+
+// ---------------------------------------------------------------------------
+// Walk all data_transfer ops inside `pipeline` and divide their static source
+// or destination sizes by `reduction_size` wherever the FIFO endpoint was
+// shrunken (i.e. its result index appears in `shrunken_fifo_map`).
+// ---------------------------------------------------------------------------
+static void patchDataTransferSizes(
+    ktdf::PipelineOp pipeline, ktdf::PrivateOp new_priv, int64_t reduction_size,
+    const llvm::DenseMap<unsigned, ktdf::FifoSlotType>& shrunken_fifo_map,
+    MLIRContext* ctx) {
+  pipeline->walk([&](ktdf::DataTransferOp xfer) {
+    if (xfer.isDestFifo()) {
+      auto fifo_res = dyn_cast<OpResult>(xfer.getDestination());
+      if (fifo_res && fifo_res.getOwner() == new_priv &&
+          shrunken_fifo_map.count(fifo_res.getResultNumber())) {
+        if (auto sizes = xfer.getStaticDestSizes()) {
+          SmallVector<int64_t> new_sizes;
+          for (int64_t sz : *sizes) new_sizes.push_back(sz / reduction_size);
+          xfer.setStaticDestSizesAttr(DenseI64ArrayAttr::get(ctx, new_sizes));
+        }
+      }
+    }
+    if (xfer.isSourceFifo()) {
+      auto fifo_res = dyn_cast<OpResult>(xfer.getSource());
+      if (fifo_res && fifo_res.getOwner() == new_priv &&
+          shrunken_fifo_map.count(fifo_res.getResultNumber())) {
+        if (auto sizes = xfer.getStaticSourceSizes()) {
+          SmallVector<int64_t> new_sizes;
+          for (int64_t sz : *sizes) new_sizes.push_back(sz / reduction_size);
+          xfer.setStaticSourceSizesAttr(DenseI64ArrayAttr::get(ctx, new_sizes));
+        }
+      }
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Build a nested scf.for structure with one loop per entry in `dim_sizes`.
 // Returns the innermost loop body's insertion point via `innermost_loop` and
 // a vector of all induction variables (outermost first).
@@ -283,9 +462,9 @@ struct ReductionLoopExposurePass
       if (!parent) return WalkResult::advance();
 
       auto stage = cast<ktdf::StageOp>(parent);
-      // Avoid duplicates (multiple generics in same stage).
-      if (llvm::find(compute_stages, stage) == compute_stages.end())
-        compute_stages.push_back(stage);
+      assert(llvm::find(compute_stages, stage) == compute_stages.end() &&
+             "Expecting at most one linalg.generic per stage");
+      compute_stages.push_back(stage);
       return WalkResult::advance();
     });
 
@@ -305,39 +484,11 @@ struct ReductionLoopExposurePass
     // --- Collect per-dimension reduction sizes ---
     // Each reduction dimension gets its own scf.for loop.  The total shrink
     // factor R = product(dim_sizes[]) is used only for FIFO resizing.
-    SmallVector<int64_t> reduction_dims;
-    auto iter_types = generic_op.getIteratorTypesArray();
-    for (int64_t i = 0; i < static_cast<int64_t>(iter_types.size()); ++i)
-      if (iter_types[i] == utils::IteratorType::reduction)
-        reduction_dims.push_back(i);
-
-    if (reduction_dims.empty()) {
-      compute_stage.emitError(PASS_NAME ": reduction dim not found");
-      return failure();
-    }
-
-    auto input_type =
-        cast<RankedTensorType>(generic_op.getInputs().front().getType());
-
-    SmallVector<int64_t> dim_sizes;
-    int64_t reduction_size = 1;
-    for (int64_t reduction_dim : reduction_dims) {
-      int64_t dim_sz = input_type.getDimSize(reduction_dim);
-      if (dim_sz == ShapedType::kDynamic) {
-        LDBG(1) << PASS_NAME
-            ": dynamic reduction size not supported — skipping";
-        return success();
-      }
-      dim_sizes.push_back(dim_sz);
-      reduction_size *= dim_sz;
-    }
-
-    LDBG(1) << PASS_NAME ": reduction_dims=[";
-    for (size_t i = 0; i < reduction_dims.size(); ++i) {
-      if (i > 0) LDBG(1) << ", ";
-      LDBG(1) << reduction_dims[i] << " (size=" << dim_sizes[i] << ")";
-    }
-    LDBG(1) << "] total_reduction_size=" << reduction_size;
+    ReductionInfo reduction_info;
+    if (!collectReductionInfo(generic_op, reduction_info)) return success();
+    SmallVector<int64_t>& reduction_dims = reduction_info.reduction_dims;
+    SmallVector<int64_t>& dim_sizes = reduction_info.dim_sizes;
+    int64_t reduction_size = reduction_info.reduction_size;
 
     // --- Get the parent pipeline ---
     auto inner_pipeline = compute_stage->getParentOfType<ktdf::PipelineOp>();
@@ -352,8 +503,9 @@ struct ReductionLoopExposurePass
     Location loc = inner_pipeline.getLoc();
 
     // -----------------------------------------------------------------------
-    // 1. Shrink ALL FIFO slots in ktdf.private whose element count is a
-    //    multiple of reduction_size (= product of all per-dim sizes).
+    // 1. Find the load stage: the sibling whose depends_out token appears in
+    //    the compute stage's depends_in.  Its single FIFO-dest data_transfer
+    //    identifies fifo_in (a ktdf.private result) by result index.
     // -----------------------------------------------------------------------
     ktdf::PrivateOp priv_op = inner_pipeline.getPrivateOp();
     if (!priv_op) {
@@ -361,8 +513,6 @@ struct ReductionLoopExposurePass
       return failure();
     }
 
-    // Find the load stage: the sibling whose depends_out token appears in
-    // the compute stage's depends_in.
     ktdf::StageOp load_stage;
     for (Value tok : compute_stage.getDependsIn()) {
       for (auto sibling : inner_pipeline.getStages()) {
@@ -383,76 +533,18 @@ struct ReductionLoopExposurePass
       return failure();
     }
 
-    // From the load stage, find the data_transfer whose destination is a FIFO.
-    // Assert that there is exactly one such transfer.
-    SmallVector<ktdf::DataTransferOp> fifo_dest_transfers;
-    load_stage.getBody()->walk([&](ktdf::DataTransferOp xfer) {
-      if (xfer.isDestFifo()) fifo_dest_transfers.push_back(xfer);
-    });
-    if (fifo_dest_transfers.empty()) {
-      inner_pipeline.emitError(PASS_NAME
-                               ": no FIFO-dest data_transfer in load stage");
-      return failure();
-    }
-    if (fifo_dest_transfers.size() > 1) {
-      inner_pipeline.emitError(
-          PASS_NAME
-          ": multiple FIFO-dest data_transfers in load stage — not supported");
-      return failure();
-    }
-    Value orig_fifo_in = fifo_dest_transfers.front().getDestination();
+    unsigned fifo_in_idx = 0;
+    if (!resolveFifoInIndex(load_stage, priv_op, fifo_in_idx)) return failure();
 
-    // Validate that fifo_in is a ktdf.private result.
-    auto orig_fifo_in_result = dyn_cast<OpResult>(orig_fifo_in);
-    if (!orig_fifo_in_result || orig_fifo_in_result.getOwner() != priv_op) {
-      inner_pipeline.emitError(PASS_NAME
-                               ": fifo_in is not a ktdf.private result");
-      return failure();
-    }
-    unsigned fifo_in_idx = orig_fifo_in_result.getResultNumber();
-
-    // Build a map: original FifoSlotType → shrunken FifoSlotType for every
-    // private result whose element count is divisible by reduction_size.
+    // -----------------------------------------------------------------------
+    // 1a. Shrink ALL FIFO slots in ktdf.private whose element count is a
+    //     multiple of reduction_size (= product of all per-dim sizes).
+    // -----------------------------------------------------------------------
     llvm::DenseMap<unsigned, ktdf::FifoSlotType> shrunken_fifo_map;
-    SmallVector<Type> new_result_types(priv_op.getResultTypes());
-    for (unsigned i = 0; i < priv_op.getNumResults(); ++i) {
-      auto fifo_type =
-          dyn_cast<ktdf::FifoSlotType>(priv_op.getResult(i).getType());
-      if (!fifo_type) continue;
-      int64_t num_elems = fifo_type.getNumElements();
-      if (num_elems % reduction_size != 0) continue;
-      auto shrunken = ktdf::FifoSlotType::get(
-          ctx, fifo_type.getSrc(), fifo_type.getDest(),
-          num_elems / reduction_size, fifo_type.getElementType());
-      shrunken_fifo_map[i] = shrunken;
-      new_result_types[i] = shrunken;
-    }
-    if (shrunken_fifo_map.empty()) {
-      inner_pipeline.emitError(PASS_NAME
-                               ": no FIFO slots divisible by reduction_size");
-      return failure();
-    }
-
-    // Replace priv_op with a new one carrying all shrunken FIFO types.
-    rewriter.setInsertionPoint(priv_op);
-    auto new_priv = ktdf::PrivateOp::create(rewriter, loc, new_result_types);
-    rewriter.mergeBlocks(&priv_op.getRegion().front(),
-                         &new_priv.getRegion().front(), {});
-
-    // Patch every fifo.allocate inside the new private body.
-    new_priv.getRegion().front().walk([&](ktdf::FifoAllocateOp alloc) {
-      for (auto& [idx, shrunken] : shrunken_fifo_map) {
-        auto orig_type =
-            dyn_cast<ktdf::FifoSlotType>(priv_op.getResult(idx).getType());
-        if (orig_type && alloc.getResult(0).getType() == orig_type)
-          alloc.getResult(0).setType(shrunken);
-      }
-    });
-
-    for (auto [old_res, new_res] :
-         llvm::zip(priv_op.getResults(), new_priv.getResults()))
-      old_res.replaceAllUsesWith(new_res);
-    rewriter.eraseOp(priv_op);
+    auto new_priv_or = shrinkPrivateFifoSlots(
+        rewriter, loc, ctx, priv_op, reduction_size, shrunken_fifo_map);
+    if (failed(new_priv_or)) return failure();
+    ktdf::PrivateOp new_priv = *new_priv_or;
 
     Value fifo_in = new_priv.getResult(fifo_in_idx);
 
@@ -490,35 +582,8 @@ struct ReductionLoopExposurePass
     // 1b. Patch data_transfer static sizes for any transfer that uses a
     //     shrunken FIFO.
     // -----------------------------------------------------------------------
-    inner_pipeline->walk([&](ktdf::DataTransferOp xfer) {
-      // Check if the destination FIFO was shrunken.
-      if (xfer.isDestFifo()) {
-        auto fifo_res = dyn_cast<OpResult>(xfer.getDestination());
-        if (fifo_res && fifo_res.getOwner() == new_priv &&
-            shrunken_fifo_map.count(fifo_res.getResultNumber())) {
-          if (auto sizes = xfer.getStaticDestSizes()) {
-            SmallVector<int64_t> new_sizes;
-            for (int64_t orig_sz : *sizes)
-              new_sizes.push_back(orig_sz / reduction_size);
-            xfer.setStaticDestSizesAttr(DenseI64ArrayAttr::get(ctx, new_sizes));
-          }
-        }
-      }
-      // Check if the source FIFO was shrunken.
-      if (xfer.isSourceFifo()) {
-        auto fifo_res = dyn_cast<OpResult>(xfer.getSource());
-        if (fifo_res && fifo_res.getOwner() == new_priv &&
-            shrunken_fifo_map.count(fifo_res.getResultNumber())) {
-          if (auto sizes = xfer.getStaticSourceSizes()) {
-            SmallVector<int64_t> new_sizes;
-            for (int64_t orig_sz : *sizes)
-              new_sizes.push_back(orig_sz / reduction_size);
-            xfer.setStaticSourceSizesAttr(
-                DenseI64ArrayAttr::get(ctx, new_sizes));
-          }
-        }
-      }
-    });
+    patchDataTransferSizes(inner_pipeline, new_priv, reduction_size,
+                           shrunken_fifo_map, ctx);
 
     // -----------------------------------------------------------------------
     // 2. Build shared constants before the inner pipeline.
@@ -582,17 +647,23 @@ struct ReductionLoopExposurePass
                                     Value step) {
     Block* body = stage.getBody();
 
-    // Snapshot existing ops before we insert new ones.
-    SmallVector<Operation*> ops;
-    for (auto& op : *body) ops.push_back(&op);
+    // Capture an iterator to the first original op *before* the loop shell is
+    // prepended.  iplist iterators survive insertions elsewhere in the list, so
+    // this remains valid after buildNestedForLoops runs.
+    auto first_original = body->begin();
 
     rewriter.setInsertionPointToStart(body);
     auto nested = buildNestedForLoops(rewriter, loc, ctx, dim_sizes, start,
                                       step, /*tag_outermost=*/false);
 
-    // Move all original ops into the innermost loop body, before its yield.
-    Operation* inner_term = nested.innermost_loop.getBody()->getTerminator();
-    for (auto* op : ops) op->moveBefore(inner_term);
+    // Splice [first_original, body->end()) into the innermost loop body before
+    // its yield.  body and inner_body are different lists so body->end() is a
+    // safe past-the-end sentinel for the source range.
+    Block* inner_body = nested.innermost_loop.getBody();
+    Operation* inner_term = inner_body->getTerminator();
+    inner_body->getOperations().splice(inner_term->getIterator(),
+                                       body->getOperations(), first_original,
+                                       body->end());
 
     return nested;
   }
@@ -711,11 +782,9 @@ struct ReductionLoopExposurePass
 
     // Now populate the innermost loop body (before its yield).
     scf::ForOp innermost = nested.innermost_loop;
-    Block* inner_body = innermost.getBody();
-    Operation* inner_yield = inner_body->getTerminator();
+    Operation* inner_yield = innermost.getBody()->getTerminator();
 
-    OpBuilder body_builder = OpBuilder::atBlockBegin(inner_body);
-    body_builder.setInsertionPoint(inner_yield);
+    OpBuilder body_builder(inner_yield);
 
     // The iter_arg of the innermost loop is the accumulator carried in.
     Value carry = innermost.getRegionIterArgs().front();
@@ -736,11 +805,8 @@ struct ReductionLoopExposurePass
     Value is_last = buildAllLast(body_builder, loc, nested.ivs, last_vals);
     auto if_op = scf::IfOp::create(body_builder, loc, TypeRange{}, is_last,
                                    /*withElseRegion=*/false);
-    {
-      OpBuilder then_builder =
-          OpBuilder::atBlockBegin(&if_op.getThenRegion().front());
-      ktdf::WriteToFifoOp::create(then_builder, loc, updated_carry, fifo_out);
-    }
+    OpBuilder then_builder(if_op.getThenRegion().front().getTerminator());
+    ktdf::WriteToFifoOp::create(then_builder, loc, updated_carry, fifo_out);
 
     // Replace the placeholder yield in the innermost loop with the real one.
     inner_yield->setOperand(0, updated_carry);
@@ -772,17 +838,22 @@ struct ReductionLoopExposurePass
       return WalkResult::interrupt();
     });
 
-    // Snapshot all existing ops.
-    SmallVector<Operation*> all_ops;
-    for (auto& op : *body) all_ops.push_back(&op);
+    // Capture an iterator to the first original op *before* the loop shell is
+    // prepended.  iplist iterators survive insertions elsewhere in the list, so
+    // this remains valid after buildNestedForLoops runs.
+    auto first_original = body->begin();
 
     rewriter.setInsertionPointToStart(body);
     auto nested = buildNestedForLoops(rewriter, loc, ctx, dim_sizes, start,
                                       step, /*tag_outermost=*/false);
-    Operation* inner_term = nested.innermost_loop.getBody()->getTerminator();
+    Block* inner_body = nested.innermost_loop.getBody();
+    Operation* inner_term = inner_body->getTerminator();
 
-    // Move all ops into the innermost loop body.
-    for (auto* op : all_ops) op->moveBefore(inner_term);
+    // Splice [first_original, body->end()) into the innermost loop body before
+    // its yield.
+    inner_body->getOperations().splice(inner_term->getIterator(),
+                                       body->getOperations(), first_original,
+                                       body->end());
 
     if (!transfer) return;  // no transfer found — nothing to guard
 
