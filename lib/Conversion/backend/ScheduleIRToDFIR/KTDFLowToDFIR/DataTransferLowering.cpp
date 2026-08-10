@@ -56,6 +56,7 @@ mlir::Value insertSplatShuffle(mlir::PatternRewriter& rewriter,
 
   return mlir::vectorchain::ShuffleOp::create(
              rewriter, loc, result_type, src_vec,
+             /*variable=*/mlir::ValueRange{}, /*pad=*/mlir::ValueRange{},
              /*mask=*/nullptr,
              /*dbgName=*/nullptr, indices_attr,
              rewriter.getI32IntegerAttr(repetition))

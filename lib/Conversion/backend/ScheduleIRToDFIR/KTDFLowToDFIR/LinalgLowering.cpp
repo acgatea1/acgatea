@@ -500,6 +500,7 @@ struct LowerLinalgFillPattern
         {mlir::IntegerAttr::get(rewriter.getI32Type(), 0)});
     auto shuffle = mlir::vectorchain::ShuffleOp::create(
         rewriter, loc, out_vec_type, bitstream.getResult(),
+        /*variable=*/mlir::ValueRange{}, /*pad=*/mlir::ValueRange{},
         /*mask=*/nullptr, /*dbgName=*/nullptr, indices_attr,
         static_cast<uint32_t>(total_elements));
 

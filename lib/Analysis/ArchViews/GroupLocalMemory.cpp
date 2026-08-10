@@ -23,9 +23,8 @@
 
 using namespace scheduler::arch_view;
 
-GroupLocalMemory::GroupLocalMemory(mlir::ktdf_arch::DeviceOp declaration,
-                                   mlir::AnalysisManager& analyses)
-    : DeviceView(declaration, analyses) {
+GroupLocalMemory::GroupLocalMemory(const mlir::ktdf_arch::Device& device)
+    : DeviceView(device) {
   initialize();
 }
 

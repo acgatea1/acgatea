@@ -307,8 +307,8 @@ struct MapReductionPartialsPass
       return;
     }
     auto& group_local_mem =
-        getChildAnalysis<scheduler::arch_view::GroupLocalMemory>(
-            device->getDeclaration());
+        device_manager.getOrCreateView<scheduler::arch_view::GroupLocalMemory>(
+            *device);
 
     SmallVector<linalg::GenericOp> candidates;
     module.walk([&](linalg::GenericOp generic_op) {

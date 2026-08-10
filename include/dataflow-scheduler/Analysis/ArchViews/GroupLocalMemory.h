@@ -29,7 +29,6 @@
 
 #include <llvm/ADT/DenseMap.h>
 #include <mlir/IR/Attributes.h>
-#include <mlir/Pass/AnalysisManager.h>
 
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
 
@@ -40,8 +39,7 @@ namespace scheduler::arch_view {
 /// Constructed as a DeviceView child of a DeviceOp
 class GroupLocalMemory : public mlir::ktdf_arch::DeviceView {
  public:
-  explicit GroupLocalMemory(mlir::ktdf_arch::DeviceOp declaration,
-                            mlir::AnalysisManager& analyses);
+  explicit GroupLocalMemory(const mlir::ktdf_arch::Device& device);
 
   /// Returns the kind attribute of the local memory co-located with the
   /// exec_unit identified by @p exec_unit_kind, or nullptr if no such mapping
