@@ -18,6 +18,8 @@
 
 #include "dataflow-scheduler/Analysis/ArchViews/GroupLocalMemory.h"
 
+#include <llvm/ADT/SmallPtrSet.h>
+
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
@@ -31,48 +33,31 @@ GroupLocalMemory::GroupLocalMemory(const mlir::ktdf_arch::Device& device)
 
 void GroupLocalMemory::initialize() {
   // Walk every group in the device definition.  For each group, scan its
-  // immediate children for exec_unit ops and memory ops.  Build the map
-  //   exec_unit.kind -> memory.kind
-  // for every exec_unit that shares a group body with at least one memory.
-  //
-  // Ambiguous cases are warned about and recorded as nullptr; they only become
-  // a hard error if actually queried (see getLocalMemoryKindForStage).
+  // immediate children for exec_unit ops and memory ops.  For each exec_unit
+  // kind the set of local memory kinds is intersected across all groups that
+  // contain it — only memory kinds present in every such group are retained.
+  // Ambiguity (intersection set size > 1) is not diagnosed here; it
+  // surfaces as an error in getLocalMemoryKindForStage if queried.
   getDevice().getBodyRegion().walk([&](mlir::ktdf_arch::GroupOp group) {
-    // Collect the kinds of exec_units and any memory kind seen in this
-    // group's immediate body (no recursion into nested groups).
     llvm::SmallVector<mlir::Attribute> exec_kinds;
-    mlir::Attribute mem_kind;
+    llvm::SmallPtrSet<mlir::Attribute, 1> mem_kinds;
 
     for (auto& op : group.getRegion().front().getOperations()) {
       if (auto exec_op =
               mlir::dyn_cast<mlir::ktdf_arch::ExecutionUnitOp>(&op)) {
         if (mlir::Attribute k = exec_op.getKind()) exec_kinds.push_back(k);
       } else if (auto mem_op = mlir::dyn_cast<mlir::ktdf_arch::MemoryOp>(&op)) {
-        mlir::Attribute k = mem_op.getKind();
-        if (!mem_kind) {
-          mem_kind = k;
-        } else if (mem_kind != k) {
-          group->emitWarning("ambiguous local memory kind in group: '")
-              << mem_kind << "' vs '" << k
-              << "'; local memory will be unavailable for exec_units in this "
-                 "group";
-          mem_kind = nullptr;
-        }
+        if (mlir::Attribute k = mem_op.getKind()) mem_kinds.insert(k);
       }
     }
-
-    if (!mem_kind) return mlir::WalkResult::advance();
 
     // TODO: only record exec_units that have an explicit ktdf_arch.datapath
     // to/from the memory — co-location alone does not imply access.
     for (mlir::Attribute ek : exec_kinds) {
-      auto [it, inserted] = exec_to_mem_kind_.try_emplace(ek, mem_kind);
-      if (!inserted && it->second != mem_kind) {
-        group->emitWarning("ambiguous local memory kind for exec_unit kind '")
-            << ek << "': already mapped to '" << it->second << "', now seeing '"
-            << mem_kind << "'";
-        it->second = nullptr;
-      }
+      auto [it, inserted] = exec_to_mem_kinds_.try_emplace(ek, mem_kinds);
+      if (!inserted)
+        for (mlir::Attribute mk : llvm::make_early_inc_range(it->second))
+          if (!mem_kinds.count(mk)) it->second.erase(mk);
     }
 
     return mlir::WalkResult::advance();
@@ -81,9 +66,9 @@ void GroupLocalMemory::initialize() {
 
 mlir::Attribute GroupLocalMemory::getLocalMemoryKind(
     mlir::Attribute exec_unit_kind) const {
-  auto it = exec_to_mem_kind_.find(exec_unit_kind);
-  if (it == exec_to_mem_kind_.end()) return nullptr;
-  return it->second;
+  auto it = exec_to_mem_kinds_.find(exec_unit_kind);
+  if (it == exec_to_mem_kinds_.end() || it->second.size() != 1) return nullptr;
+  return *it->second.begin();
 }
 
 mlir::Attribute GroupLocalMemory::getLocalMemoryKindForStage(

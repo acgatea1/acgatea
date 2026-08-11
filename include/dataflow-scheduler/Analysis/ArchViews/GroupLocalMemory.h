@@ -27,6 +27,7 @@
 #define DATAFLOW_SCHEDULER_ANALYSIS_ARCHVIEWS_GROUPLOCALMEMORY_H_
 
 #include <llvm/ADT/DenseMap.h>
+#include <llvm/ADT/SmallPtrSet.h>
 #include <mlir/IR/Attributes.h>
 
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
@@ -36,10 +37,11 @@ namespace scheduler::arch_view {
 
 /// Maps exec_unit kind -> local memory kind for groups that contain both.
 ///
-/// Ambiguous cases (conflicting memory kinds within a group, or the same
-/// exec_unit kind mapping to different memories across groups) are warned
-/// about during construction and stored as nullptr.  They only become hard
-/// errors if actually queried via getLocalMemoryKindForStage.
+/// During construction the set of memory kinds for each exec_unit kind is
+/// intersected across all groups that contain it — only memory kinds present
+/// in every such group are retained.  Ambiguity (intersection size > 1) is
+/// not diagnosed at construction time; it becomes a hard error only if that
+/// exec_unit kind is queried via getLocalMemoryKindForStage.
 ///
 /// Constructed as a DeviceView child of a DeviceOp.
 class GroupLocalMemory : public mlir::ktdf_arch::DeviceView {
@@ -47,10 +49,8 @@ class GroupLocalMemory : public mlir::ktdf_arch::DeviceView {
   explicit GroupLocalMemory(const mlir::ktdf_arch::Device& device);
 
   /// Returns the kind attribute of the local memory co-located with the
-  /// exec_unit identified by @p exec_unit_kind.
-  ///
-  /// Returns nullptr if no mapping exists for @p exec_unit_kind, or if the
-  /// mapping was marked ambiguous during construction (see class comment).
+  /// exec_unit identified by @p exec_unit_kind, or nullptr if no
+  /// unambiguous mapping exists.
   [[nodiscard]] mlir::Attribute getLocalMemoryKind(
       mlir::Attribute exec_unit_kind) const;
 
@@ -64,8 +64,10 @@ class GroupLocalMemory : public mlir::ktdf_arch::DeviceView {
       mlir::ktdf::StageOp stage) const;
 
  private:
-  /// exec_unit kind -> local memory kind, or nullptr if ambiguous.
-  llvm::DenseMap<mlir::Attribute, mlir::Attribute> exec_to_mem_kind_;
+  /// exec_unit kind -> set of all memory kinds seen for that exec_unit kind.
+  /// SmallPtrSet<1> keeps the common single-element case inline.
+  llvm::DenseMap<mlir::Attribute, llvm::SmallPtrSet<mlir::Attribute, 1>>
+      exec_to_mem_kinds_;
 
   void initialize();
 };
