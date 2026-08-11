@@ -103,17 +103,35 @@ struct LowerLinalgGenericPattern
     for (mlir::Operation* op : ops_to_lower) {
       mlir::LogicalResult result =
           mlir::TypeSwitch<mlir::Operation*, mlir::LogicalResult>(op)
-              // arith.mulf %lhs, %rhs -> vectorchain.binary {binary_op = mul}
-              .Case<mlir::arith::MulFOp>([&](mlir::arith::MulFOp mulf_op) {
-                return lowerMulFOp(mulf_op, rewriter, identity_map);
+              .Case<mlir::arith::MulFOp>([&](mlir::arith::MulFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::mul);
               })
-              // arith.addf %lhs, %rhs -> vectorchain.binary {binary_op = add}
-              .Case<mlir::arith::AddFOp>([&](mlir::arith::AddFOp addf_op) {
-                return lowerAddFOp(addf_op, rewriter, identity_map);
+              .Case<mlir::arith::AddFOp>([&](mlir::arith::AddFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::add);
               })
-              // arith.subf %lhs, %rhs -> vectorchain.binary {binary_op = sub}
-              .Case<mlir::arith::SubFOp>([&](mlir::arith::SubFOp subf_op) {
-                return lowerSubFOp(subf_op, rewriter, identity_map);
+              .Case<mlir::arith::SubFOp>([&](mlir::arith::SubFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::sub);
+              })
+              .Case<mlir::arith::MaximumFOp>([&](mlir::arith::MaximumFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::max);
+              })
+              .Case<mlir::arith::MinimumFOp>([&](mlir::arith::MinimumFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::min);
+              })
+              .Case<mlir::arith::MaxNumFOp>([&](mlir::arith::MaxNumFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::abs_max);
               })
               .Default([](mlir::Operation* unknown_op) {
                 return unknown_op->emitError(
@@ -174,14 +192,35 @@ struct LowerLinalgGenericPattern
     for (mlir::Operation* op : ops_to_lower) {
       mlir::LogicalResult result =
           mlir::TypeSwitch<mlir::Operation*, mlir::LogicalResult>(op)
-              .Case<mlir::arith::MulFOp>([&](mlir::arith::MulFOp mulf_op) {
-                return lowerMulFOp(mulf_op, rewriter, identity_map);
+              .Case<mlir::arith::MulFOp>([&](mlir::arith::MulFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::mul);
               })
-              .Case<mlir::arith::AddFOp>([&](mlir::arith::AddFOp addf_op) {
-                return lowerAddFOp(addf_op, rewriter, identity_map);
+              .Case<mlir::arith::AddFOp>([&](mlir::arith::AddFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::add);
               })
-              .Case<mlir::arith::SubFOp>([&](mlir::arith::SubFOp subf_op) {
-                return lowerSubFOp(subf_op, rewriter, identity_map);
+              .Case<mlir::arith::SubFOp>([&](mlir::arith::SubFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::sub);
+              })
+              .Case<mlir::arith::MaximumFOp>([&](mlir::arith::MaximumFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::max);
+              })
+              .Case<mlir::arith::MinimumFOp>([&](mlir::arith::MinimumFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::min);
+              })
+              .Case<mlir::arith::MaxNumFOp>([&](mlir::arith::MaxNumFOp op) {
+                return lowerBinaryFOp(
+                    op, op.getLhs(), op.getRhs(), rewriter, identity_map,
+                    mlir::vectorchain::VectorChainBinaryOperator::abs_max);
               })
               .Default([](mlir::Operation* unknown_op) {
                 return unknown_op->emitError(
@@ -230,6 +269,12 @@ struct LowerLinalgGenericPattern
       binary_kind = mlir::vectorchain::VectorChainBinaryOperator::mul;
     else if (mlir::isa<mlir::arith::SubFOp>(body_ops[0]))
       binary_kind = mlir::vectorchain::VectorChainBinaryOperator::sub;
+    else if (mlir::isa<mlir::arith::MaximumFOp>(body_ops[0]))
+      binary_kind = mlir::vectorchain::VectorChainBinaryOperator::max;
+    else if (mlir::isa<mlir::arith::MinimumFOp>(body_ops[0]))
+      binary_kind = mlir::vectorchain::VectorChainBinaryOperator::min;
+    else if (mlir::isa<mlir::arith::MaxNumFOp>(body_ops[0]))
+      binary_kind = mlir::vectorchain::VectorChainBinaryOperator::abs_max;
     else
       return body_ops[0]->emitError(
           "unsupported reduction body op in linalg.generic");
@@ -376,57 +421,20 @@ struct LowerLinalgGenericPattern
         .getResult();
   }
 
-  // arith.mulf visitor: lowers to vectorchain.binary {binary_op = mul}
-  mlir::LogicalResult lowerMulFOp(mlir::arith::MulFOp mulf_op,
-                                  mlir::PatternRewriter& rewriter,
-                                  mlir::AffineMap identity_map) const {
-    auto vector_type =
-        getFlattenedVectorType(mulf_op.getLhs().getType(), resource_kinds_);
+  // Unified helper: lowers any two-operand arith float op to
+  // vectorchain.binary with the given binary_kind.
+  mlir::LogicalResult lowerBinaryFOp(
+      mlir::Operation* op, mlir::Value lhs, mlir::Value rhs,
+      mlir::PatternRewriter& rewriter, mlir::AffineMap identity_map,
+      mlir::vectorchain::VectorChainBinaryOperator binary_kind) const {
+    auto vector_type = getFlattenedVectorType(lhs.getType(), resource_kinds_);
     if (!vector_type) return mlir::failure();
 
     auto binary_op = mlir::vectorchain::BinaryOp::create(
-        rewriter, mulf_op.getLoc(), vector_type, mulf_op.getLhs(),
-        mulf_op.getRhs(),
-        /*mask=*/nullptr, /*dbgName=*/nullptr,
-        mlir::vectorchain::VectorChainBinaryOperator::mul, identity_map);
+        rewriter, op->getLoc(), vector_type, lhs, rhs,
+        /*mask=*/nullptr, /*dbgName=*/nullptr, binary_kind, identity_map);
 
-    rewriter.replaceOp(mulf_op, binary_op.getData());
-    return mlir::success();
-  }
-
-  // arith.addf visitor: lowers to vectorchain.binary {binary_op = add}
-  mlir::LogicalResult lowerAddFOp(mlir::arith::AddFOp addf_op,
-                                  mlir::PatternRewriter& rewriter,
-                                  mlir::AffineMap identity_map) const {
-    auto vector_type =
-        getFlattenedVectorType(addf_op.getLhs().getType(), resource_kinds_);
-    if (!vector_type) return mlir::failure();
-
-    auto binary_op = mlir::vectorchain::BinaryOp::create(
-        rewriter, addf_op.getLoc(), vector_type, addf_op.getLhs(),
-        addf_op.getRhs(),
-        /*mask=*/nullptr, /*dbgName=*/nullptr,
-        mlir::vectorchain::VectorChainBinaryOperator::add, identity_map);
-
-    rewriter.replaceOp(addf_op, binary_op.getData());
-    return mlir::success();
-  }
-
-  // arith.subf visitor: lowers to vectorchain.binary {binary_op = sub}
-  mlir::LogicalResult lowerSubFOp(mlir::arith::SubFOp subf_op,
-                                  mlir::PatternRewriter& rewriter,
-                                  mlir::AffineMap identity_map) const {
-    auto vector_type =
-        getFlattenedVectorType(subf_op.getLhs().getType(), resource_kinds_);
-    if (!vector_type) return mlir::failure();
-
-    auto binary_op = mlir::vectorchain::BinaryOp::create(
-        rewriter, subf_op.getLoc(), vector_type, subf_op.getLhs(),
-        subf_op.getRhs(),
-        /*mask=*/nullptr, /*dbgName=*/nullptr,
-        mlir::vectorchain::VectorChainBinaryOperator::sub, identity_map);
-
-    rewriter.replaceOp(subf_op, binary_op.getData());
+    rewriter.replaceOp(op, binary_op.getData());
     return mlir::success();
   }
 };
