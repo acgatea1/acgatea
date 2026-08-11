@@ -29,6 +29,7 @@
 #include <llvm/ADT/DenseMap.h>
 #include <mlir/IR/Attributes.h>
 
+#include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
 
 namespace scheduler::arch_view {
@@ -45,6 +46,15 @@ class GroupLocalMemory : public mlir::ktdf_arch::DeviceView {
   /// exists.
   [[nodiscard]] mlir::Attribute getLocalMemoryKind(
       mlir::Attribute exec_unit_kind) const;
+
+  /// Returns the local memory kind for the single exec_unit kind declared on
+  /// @p stage, or nullptr if the stage has an ambiguous / missing exec_unit
+  /// kind or if no local memory is mapped to it.
+  ///
+  /// Emits an error on @p stage on failure so the caller can propagate it
+  /// without reconstructing the message.
+  [[nodiscard]] mlir::Attribute getLocalMemoryKindForStage(
+      mlir::ktdf::StageOp stage) const;
 
  private:
   /// exec_unit kind -> local memory kind.

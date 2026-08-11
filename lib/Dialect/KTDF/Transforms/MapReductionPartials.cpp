@@ -204,31 +204,21 @@ static Value convertInputToMemref(OpBuilder& builder,
 static LogicalResult rewriteGeneric(
     linalg::GenericOp generic_op,
     scheduler::arch_view::GroupLocalMemory& group_local_mem) {
-  // Step 1: create memref.alloc for the accumulator at the top of the stage
-  // body.
+  auto stage = generic_op->getParentOfType<ktdf::StageOp>();
+  assert(stage && "expected enclosing ktdf.stage");
+
+  // Stage 1: decide which memory kind backs the accumulator.
+  Attribute mem_space = group_local_mem.getLocalMemoryKindForStage(stage);
+  if (!mem_space) return failure();
+
+  // Stage 2: rewrite the generic to buffer semantics using `mem_space`.
   OpBuilder builder(generic_op);
   Location loc = generic_op.getLoc();
 
-  auto stage = generic_op->getParentOfType<ktdf::StageOp>();
-  assert(stage && "expected enclosing ktdf.stage");
   builder.setInsertionPointToStart(stage.getBody());
   auto out_tensor_type =
       cast<RankedTensorType>(generic_op.getDpsInitOperand(0)->get().getType());
 
-  // Derive the local memory kind from the stage's exec_unit kind.
-  // applicable_units carries the exec_unit kind (e.g. "SFU"); the analysis
-  // maps that to the memory private to the same group (e.g. "SFU_REG").
-  Attribute mem_space;
-  if (const auto applicable_units = stage.getApplicableUnits();
-      applicable_units && applicable_units->size() == 1) {
-    Attribute exec_kind = applicable_units->getValue().front();
-    mem_space = group_local_mem.getLocalMemoryKind(exec_kind);
-  }
-  if (!mem_space) {
-    generic_op.emitError(
-        "No local memory found for compute unit in device description");
-    return failure();
-  }
   auto alloc_type = MemRefType::get(out_tensor_type.getShape(),
                                     out_tensor_type.getElementType(),
                                     MemRefLayoutAttrInterface{}, mem_space);

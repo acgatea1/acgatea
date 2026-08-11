@@ -18,6 +18,7 @@
 
 #include "dataflow-scheduler/Analysis/ArchViews/GroupLocalMemory.h"
 
+#include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/KTDFArch.h"
 
@@ -33,9 +34,10 @@ void GroupLocalMemory::initialize() {
   // immediate children for exec_unit ops and memory ops.  Build the map
   //   exec_unit.kind -> memory.kind
   // for every exec_unit that shares a group body with at least one memory.
-  getDevice().getDefinition().walk([&](mlir::ktdf_arch::GroupOp group) {
-    // Collect the kinds of exec_units and the first memory kind seen in this
-    // group's immediate body (no recursion into nested groups).
+  getDevice().getBodyRegion().walk([&](mlir::ktdf_arch::GroupOp group) {
+    // Collect the kinds of exec_units and any memory kind seen in this
+    // group's immediate body (no recursion into nested groups). Bail if
+    // different memory kinds occur in the same exec_unit.
     llvm::SmallVector<mlir::Attribute> exec_kinds;
     mlir::Attribute mem_kind;
 
@@ -44,13 +46,27 @@ void GroupLocalMemory::initialize() {
               mlir::dyn_cast<mlir::ktdf_arch::ExecutionUnitOp>(&op)) {
         if (mlir::Attribute k = exec_op.getKind()) exec_kinds.push_back(k);
       } else if (auto mem_op = mlir::dyn_cast<mlir::ktdf_arch::MemoryOp>(&op)) {
-        if (!mem_kind) mem_kind = mem_op.getKind();
+        mlir::Attribute k = mem_op.getKind();
+        if (!mem_kind) {
+          mem_kind = k;
+        } else if (mem_kind != k) {
+          group->emitError("ambiguous local memory kind in group: '")
+              << mem_kind << "' vs '" << k << "'";
+          return mlir::WalkResult::interrupt();
+        }
       }
     }
 
     if (mem_kind) {
-      for (mlir::Attribute ek : exec_kinds)
-        exec_to_mem_kind_.insert({ek, mem_kind});
+      for (mlir::Attribute ek : exec_kinds) {
+        auto [it, inserted] = exec_to_mem_kind_.try_emplace(ek, mem_kind);
+        if (!inserted && it->second != mem_kind) {
+          group->emitError("ambiguous local memory kind for exec_unit kind '")
+              << ek << "': already mapped to '" << it->second
+              << "', now seeing '" << mem_kind << "'";
+          return mlir::WalkResult::interrupt();
+        }
+      }
     }
 
     return mlir::WalkResult::advance();
@@ -62,4 +78,21 @@ mlir::Attribute GroupLocalMemory::getLocalMemoryKind(
   auto it = exec_to_mem_kind_.find(exec_unit_kind);
   if (it == exec_to_mem_kind_.end()) return nullptr;
   return it->second;
+}
+
+mlir::Attribute GroupLocalMemory::getLocalMemoryKindForStage(
+    mlir::ktdf::StageOp stage) const {
+  const auto applicable_units = stage.getApplicableUnits();
+  if (!applicable_units || applicable_units->size() != 1) {
+    stage->emitError("expected exactly one applicable exec_unit on ktdf.stage");
+    return {};
+  }
+  mlir::Attribute exec_kind = applicable_units->getValue().front();
+  mlir::Attribute mem_kind = getLocalMemoryKind(exec_kind);
+  if (!mem_kind) {
+    stage->emitError("no local memory found for exec_unit kind '")
+        << exec_kind << "' in device description";
+    return {};
+  }
+  return mem_kind;
 }
