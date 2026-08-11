@@ -56,8 +56,8 @@ void GroupLocalMemory::initialize() {
     for (mlir::Attribute ek : exec_kinds) {
       auto [it, inserted] = exec_to_mem_kinds_.try_emplace(ek, mem_kinds);
       if (!inserted)
-        for (mlir::Attribute mk : llvm::make_early_inc_range(it->second))
-          if (!mem_kinds.count(mk)) it->second.erase(mk);
+        it->second.remove_if(
+            [&](mlir::Attribute mk) { return !mem_kinds.count(mk); });
     }
 
     return mlir::WalkResult::advance();
