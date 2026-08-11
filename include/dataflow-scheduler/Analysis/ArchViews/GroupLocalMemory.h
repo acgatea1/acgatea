@@ -36,28 +36,35 @@ namespace scheduler::arch_view {
 
 /// Maps exec_unit kind -> local memory kind for groups that contain both.
 ///
-/// Constructed as a DeviceView child of a DeviceOp
+/// Ambiguous cases (conflicting memory kinds within a group, or the same
+/// exec_unit kind mapping to different memories across groups) are warned
+/// about during construction and stored as nullptr.  They only become hard
+/// errors if actually queried via getLocalMemoryKindForStage.
+///
+/// Constructed as a DeviceView child of a DeviceOp.
 class GroupLocalMemory : public mlir::ktdf_arch::DeviceView {
  public:
   explicit GroupLocalMemory(const mlir::ktdf_arch::Device& device);
 
   /// Returns the kind attribute of the local memory co-located with the
-  /// exec_unit identified by @p exec_unit_kind, or nullptr if no such mapping
-  /// exists.
+  /// exec_unit identified by @p exec_unit_kind.
+  ///
+  /// Returns nullptr if no mapping exists for @p exec_unit_kind, or if the
+  /// mapping was marked ambiguous during construction (see class comment).
   [[nodiscard]] mlir::Attribute getLocalMemoryKind(
       mlir::Attribute exec_unit_kind) const;
 
   /// Returns the local memory kind for the single exec_unit kind declared on
-  /// @p stage, or nullptr if the stage has an ambiguous / missing exec_unit
-  /// kind or if no local memory is mapped to it.
+  /// @p stage.
   ///
-  /// Emits an error on @p stage on failure so the caller can propagate it
-  /// without reconstructing the message.
+  /// Emits an error on @p stage and returns nullptr if:
+  ///   - the stage does not have exactly one applicable exec_unit, or
+  ///   - no unambiguous local memory is mapped to that exec_unit kind.
   [[nodiscard]] mlir::Attribute getLocalMemoryKindForStage(
       mlir::ktdf::StageOp stage) const;
 
  private:
-  /// exec_unit kind -> local memory kind.
+  /// exec_unit kind -> local memory kind, or nullptr if ambiguous.
   llvm::DenseMap<mlir::Attribute, mlir::Attribute> exec_to_mem_kind_;
 
   void initialize();

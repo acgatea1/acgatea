@@ -34,10 +34,12 @@ void GroupLocalMemory::initialize() {
   // immediate children for exec_unit ops and memory ops.  Build the map
   //   exec_unit.kind -> memory.kind
   // for every exec_unit that shares a group body with at least one memory.
+  //
+  // Ambiguous cases are warned about and recorded as nullptr; they only become
+  // a hard error if actually queried (see getLocalMemoryKindForStage).
   getDevice().getBodyRegion().walk([&](mlir::ktdf_arch::GroupOp group) {
     // Collect the kinds of exec_units and any memory kind seen in this
-    // group's immediate body (no recursion into nested groups). Bail if
-    // different memory kinds occur in the same exec_unit.
+    // group's immediate body (no recursion into nested groups).
     llvm::SmallVector<mlir::Attribute> exec_kinds;
     mlir::Attribute mem_kind;
 
@@ -50,24 +52,26 @@ void GroupLocalMemory::initialize() {
         if (!mem_kind) {
           mem_kind = k;
         } else if (mem_kind != k) {
-          group->emitError("ambiguous local memory kind in group: '")
-              << mem_kind << "' vs '" << k << "'";
-          return mlir::WalkResult::interrupt();
+          group->emitWarning("ambiguous local memory kind in group: '")
+              << mem_kind << "' vs '" << k
+              << "'; local memory will be unavailable for exec_units in this "
+                 "group";
+          mem_kind = nullptr;
         }
       }
     }
 
-    if (mem_kind) {
-      // TODO: only record exec_units that have an explicit ktdf_arch.datapath
-      // to/from the memory — co-location alone does not imply access.
-      for (mlir::Attribute ek : exec_kinds) {
-        auto [it, inserted] = exec_to_mem_kind_.try_emplace(ek, mem_kind);
-        if (!inserted && it->second != mem_kind) {
-          group->emitError("ambiguous local memory kind for exec_unit kind '")
-              << ek << "': already mapped to '" << it->second
-              << "', now seeing '" << mem_kind << "'";
-          return mlir::WalkResult::interrupt();
-        }
+    if (!mem_kind) return mlir::WalkResult::advance();
+
+    // TODO: only record exec_units that have an explicit ktdf_arch.datapath
+    // to/from the memory — co-location alone does not imply access.
+    for (mlir::Attribute ek : exec_kinds) {
+      auto [it, inserted] = exec_to_mem_kind_.try_emplace(ek, mem_kind);
+      if (!inserted && it->second != mem_kind) {
+        group->emitWarning("ambiguous local memory kind for exec_unit kind '")
+            << ek << "': already mapped to '" << it->second << "', now seeing '"
+            << mem_kind << "'";
+        it->second = nullptr;
       }
     }
 
@@ -92,7 +96,7 @@ mlir::Attribute GroupLocalMemory::getLocalMemoryKindForStage(
   mlir::Attribute exec_kind = applicable_units->getValue().front();
   mlir::Attribute mem_kind = getLocalMemoryKind(exec_kind);
   if (!mem_kind) {
-    stage->emitError("no local memory found for exec_unit kind '")
+    stage->emitError("no unambiguous local memory found for exec_unit kind '")
         << exec_kind << "' in device description";
     return {};
   }
