@@ -58,6 +58,8 @@ void GroupLocalMemory::initialize() {
     }
 
     if (mem_kind) {
+      // TODO: only record exec_units that have an explicit ktdf_arch.datapath
+      // to/from the memory — co-location alone does not imply access.
       for (mlir::Attribute ek : exec_kinds) {
         auto [it, inserted] = exec_to_mem_kind_.try_emplace(ek, mem_kind);
         if (!inserted && it->second != mem_kind) {
