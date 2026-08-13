@@ -28,6 +28,7 @@
 #include <map>
 
 #include "dataflow-scheduler/Analysis/ArchViews/ResourceKinds.h"
+#include "dataflow-scheduler/Analysis/WriteSetScan.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/ComponentClassifier.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/PipelineExecutionTransform.h"
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/ScratchpadConflicts.h"
@@ -65,17 +66,107 @@ namespace scheduler {
 namespace {
 
 // ---------------------------------------------------------------------------
+// Check whether there is a genuine cross-iteration scratchpad dependency
+// between load_stage and store_stage.
+//
+// The load stage reads from a shared scratchpad (memref source) into FIFOs or
+// other local buffers.  The store stage writes the computed result back into
+// that same scratchpad on the next iteration, creating a loop-carried RAW.
+//
+// Algorithm:
+//   1. Collect every ktdf.data_transfer inside load_stage whose source
+//      is a memref (i.e. not a FIFO).
+//   2. For each such transfer, ask scheduler::regionWritesTo whether
+//      store_stage's region writes through the same source memref.
+//   3. If any transfer matches, a back-edge is needed.  All matching
+//      transfers are returned via transfers_with_dependency so the caller
+//      can attach them to BackEdgeInfo for later use during signal insertion.
+//
+// Returns true iff at least one transfer with a dependency was found.
+// ---------------------------------------------------------------------------
+static bool stageHasBackedgeDependency(
+    mlir::ktdf::StageOp load_stage, mlir::ktdf::StageOp store_stage,
+    llvm::SmallVectorImpl<mlir::ktdf::DataTransferOp>&
+        transfers_with_dependency) {
+  // Collect data transfers in load_stage whose source is a memref (not a
+  // FIFO) — these are the reads from the shared scratchpad.
+  llvm::SmallVector<mlir::ktdf::DataTransferOp, 4> load_transfers;
+  load_stage.walk([&](mlir::ktdf::DataTransferOp xfer) {
+    if (!xfer.isSourceFifo()) load_transfers.push_back(xfer);
+  });
+
+  // For each load transfer, check whether store_stage writes to the same
+  // scratchpad memref that load_stage reads from.
+  mlir::Region& store_region = store_stage.getRegion();
+  for (mlir::ktdf::DataTransferOp xfer : load_transfers) {
+    if (scheduler::regionWritesTo(store_region, xfer.getSource()))
+      transfers_with_dependency.push_back(xfer);
+  }
+  return !transfers_with_dependency.empty();
+}
+
+// ---------------------------------------------------------------------------
+// Walk the def-use chains of each transfer in transfers_with_dependency and
+// collect the distinct non-trivial scf.for loops whose induction variables
+// appear as BlockArguments in those chains.
+//
+// Algorithm:
+//   - Maintain a worklist of Values, seeded with the index operands of each
+//     qualifying transfer (not the destination memref — only the address
+//     computation operands can reveal which loop IVs govern the scratchpad).
+//   - For each Value: if it is a BlockArgument that is the induction variable
+//     of an scf.for, record that ForOp (once) unless its static trip count
+//     is <= 1.
+//   - If it is an Operation result, push all operands of the defining op onto
+//     the worklist to follow the chain transitively.
+// ---------------------------------------------------------------------------
+static llvm::SmallVector<mlir::scf::ForOp, 2> collectDependentLoops(
+    llvm::ArrayRef<mlir::ktdf::DataTransferOp> transfers_with_dependency) {
+  llvm::SmallVector<mlir::scf::ForOp, 2> result;
+  llvm::DenseSet<mlir::Block*> seen_blocks;
+  llvm::DenseSet<mlir::Value> visited;
+  llvm::SmallVector<mlir::Value> worklist;
+
+  for (mlir::ktdf::DataTransferOp xfer : transfers_with_dependency)
+    for (mlir::Value idx : xfer.getSourceIndices()) worklist.push_back(idx);
+
+  while (!worklist.empty()) {
+    mlir::Value v = worklist.pop_back_val();
+    if (!visited.insert(v).second) continue;
+
+    if (auto block_arg = mlir::dyn_cast<mlir::BlockArgument>(v)) {
+      mlir::Block* owner = block_arg.getOwner();
+      if (!seen_blocks.insert(owner).second) continue;
+      auto for_op =
+          mlir::dyn_cast_or_null<mlir::scf::ForOp>(owner->getParentOp());
+      if (!for_op) continue;
+      if (for_op.getInductionVar() != v) continue;
+      // Discard trivial loops (trip count statically known to be <= 1).
+      if (auto tc = for_op.getStaticTripCount(); tc && tc->ule(1)) continue;
+      result.push_back(for_op);
+    } else if (mlir::Operation* def = v.getDefiningOp()) {
+      for (mlir::Value operand : def->getOperands())
+        worklist.push_back(operand);
+    }
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
 // Augment global_dag with cross-iteration back-edges and populate
-// back_edges_out for every pipeline whose linalg.generic compute stage sits
-// inside a non-trivial scf.for that is itself enclosed by a ktdf.parallel.
+// back_edges_out for every pipeline whose linalg.generic compute stage has a
+// genuine scratchpad RAW dependency between its load and store stages.
 //
-// Search rule (walking up from the pipeline):
-//   - Stop at ktdf.parallel or func::FuncOp — the loop must be between the
-//     pipeline and the ktdf.parallel, i.e. inside the parallel body.
-//   - A loop found before hitting that boundary is the enclosing_for.
-//   - Skip if the loop has a static trip count <= 1 (no back-edge needed).
+// For each linalg.generic, stageHasBackedgeDependency verifies that
+// store_stage actually writes to a memref that load_stage loads from before
+// recording the back-edge.  collectDependentLoops then walks the def-use
+// chains of the qualifying transfers to find all non-trivial loops whose IVs
+// index the scratchpad — these are stored in BackEdgeInfo as dependent_loops
+// and drive the multi-loop conjunction guards emitted by insertSignals.
+// If no dependent loops are found the candidate is skipped (no back-edge
+// needed).
 //
-// For each qualifying pipeline the back-edge is:
+// The back-edge is:
 //   store_stage (token-successor of compute_stage) → load_stage (predecessor)
 // injected into global_dag so computeScratchpadConflicts fires on the edge,
 // while back_edges_out lets insertSignals emit guarded signals instead of the
@@ -89,28 +180,7 @@ static void addScfForPipelineBackEdges(
     auto compute_stage = generic->getParentOfType<mlir::ktdf::StageOp>();
     assert(compute_stage && "linalg.generic must be inside a ktdf.stage");
 
-    // Step 2/3: walk up from compute_stage's parent pipeline looking for an
-    // scf.for.  Stop at ktdf.parallel or func::FuncOp — the loop must be
-    // between the pipeline and the enclosing parallel.
-    auto pipeline = compute_stage->getParentOfType<mlir::ktdf::PipelineOp>();
-    assert(pipeline && "compute_stage must be inside a ktdf.pipeline");
-
-    mlir::scf::ForOp enclosing_for;
-    for (mlir::Operation* anc = pipeline->getParentOp(); anc;
-         anc = anc->getParentOp()) {
-      if (mlir::isa<mlir::ktdf::ParallelOp, mlir::func::FuncOp>(anc)) break;
-      if (auto for_op = mlir::dyn_cast<mlir::scf::ForOp>(anc)) {
-        enclosing_for = for_op;
-        break;
-      }
-    }
-    // No backedges if no enclosing loop
-    if (!enclosing_for) return;
-
-    // Step 4: skip trivial loops (trip count known to be <= 1).
-    if (auto tc = enclosing_for.getStaticTripCount(); tc && tc->ule(1)) return;
-
-    // Steps 5+6: look up load_stage and store_stage directly from global_dag.
+    // Step 2: look up load_stage and store_stage directly from global_dag.
     // compute_stage is a leaf node in global_dag (no nested pipeline), so its
     // predecessor entry is the load leaf stage and its successor is the store
     // leaf stage.
@@ -126,12 +196,29 @@ static void addScfForPipelineBackEdges(
       return;
     auto* store_stage_op = succ_it->second.front();
 
+    // Step 3: verify a genuine scratchpad dependency exists between the
+    // candidate load/store stage pair before committing the back-edge.
+    auto load_stage = mlir::cast<mlir::ktdf::StageOp>(load_stage_op);
+    auto store_stage = mlir::cast<mlir::ktdf::StageOp>(store_stage_op);
+    llvm::SmallVector<mlir::ktdf::DataTransferOp, 4> transfers_with_dependency;
+    if (!stageHasBackedgeDependency(load_stage, store_stage,
+                                    transfers_with_dependency))
+      return;
+
+    // Step 4: derive the set of non-trivial loops that govern the scratchpad
+    // address by walking the def-use chains of the qualifying transfers.
+    llvm::SmallVector<mlir::scf::ForOp, 2> dependent_loops =
+        collectDependentLoops(transfers_with_dependency);
+    if (dependent_loops.empty()) return;
+
     LDBG(1) << "  Adding scf.for pipeline back-edge: store_stage -> "
                "load_stage (cross-iteration scratchpad RAW)";
     global_dag.successors[store_stage_op].push_back(load_stage_op);
     global_dag.predecessors[load_stage_op].push_back(store_stage_op);
 
-    back_edges_out.emplace_back(store_stage_op, load_stage_op, enclosing_for);
+    back_edges_out.emplace_back(store_stage_op, load_stage_op,
+                                std::move(dependent_loops),
+                                std::move(transfers_with_dependency));
   });
 }
 
@@ -291,9 +378,9 @@ struct KTDFToKTDFLoweringPass
       }
 
       // Step 6b: Augment global_dag with cross-iteration back-edges for every
-      // pipeline whose linalg.generic compute stage sits inside a non-trivial
-      // scf.for enclosed by a ktdf.parallel.  Also collects BackEdgeInfo so
-      // insertSignals can emit loop-IV-guarded signals for these edges.
+      // pipeline that has a genuine scratchpad RAW dependency between its load
+      // and store stages.  Also collects BackEdgeInfo so insertSignals can emit
+      // loop-IV-guarded signals for these edges.
       llvm::SmallVector<BackEdgeInfo> back_edges;
       addScfForPipelineBackEdges(func, global_dag, back_edges);
 

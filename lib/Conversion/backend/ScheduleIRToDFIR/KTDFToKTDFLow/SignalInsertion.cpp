@@ -117,41 +117,52 @@ mlir::LogicalResult scheduler::insertSignals(
 
     LDBG(1) << "  Inserting guarded back-edge signals (store→load)";
 
-    mlir::scf::ForOp for_op = be.for_op;
-    mlir::Value iv = for_op.getInductionVar();
-    mlir::Value lb = for_op.getLowerBound();
-    mlir::Value ub = for_op.getUpperBound();
-    mlir::Value step = for_op.getStep();
-
-    // --- Signal at start of load_stage: recv guard (iv != lb) ---
+    // --- Signal at start of load_stage: recv guard ---
+    // Condition: all dependent loop IVs are not on their first iteration
+    //   i.e.  iv0 != lb0 && iv1 != lb1 && ...
     {
       auto load_stage = mlir::cast<mlir::ktdf::StageOp>(be.load_stage);
       mlir::Block* load_body = load_stage.getBody();
       mlir::OpBuilder builder(load_body, load_body->begin());
 
-      mlir::Value not_first = mlir::arith::CmpIOp::create(
-          builder, loc, mlir::arith::CmpIPredicate::ne, iv, lb);
-      auto if_op =
-          mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{}, not_first,
-                                  /*withElseRegion=*/false);
+      mlir::Value cond;
+      for (mlir::scf::ForOp loop : be.dependent_loops) {
+        mlir::Value not_first = mlir::arith::CmpIOp::create(
+            builder, loc, mlir::arith::CmpIPredicate::ne,
+            loop.getInductionVar(), loop.getLowerBound());
+        cond = cond ? mlir::arith::AndIOp::create(builder, loc, cond, not_first)
+                          .getResult()
+                    : not_first;
+      }
+      auto if_op = mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{},
+                                           cond, /*withElseRegion=*/false);
       mlir::OpBuilder then_builder(
           if_op.getThenRegion().front().getTerminator());
       mlir::ktdf_lowering::SignalOp::create(then_builder, loc,
                                             mlir::ValueRange(signal_units));
     }
 
-    // --- Signal at end of store_stage: send guard (iv != ub - step) ---
+    // --- Signal at end of store_stage: send guard ---
+    // Condition: all dependent loop IVs are not on their last iteration
+    //   i.e.  iv0 != ub0-step0 && iv1 != ub1-step1 && ...
     {
       auto store_stage = mlir::cast<mlir::ktdf::StageOp>(be.store_stage);
       mlir::Block* store_body = store_stage.getBody();
       mlir::OpBuilder builder(store_body, store_body->end());
 
-      mlir::Value last_iv = mlir::arith::SubIOp::create(builder, loc, ub, step);
-      mlir::Value not_last = mlir::arith::CmpIOp::create(
-          builder, loc, mlir::arith::CmpIPredicate::ne, iv, last_iv);
-      auto if_op =
-          mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{}, not_last,
-                                  /*withElseRegion=*/false);
+      mlir::Value cond;
+      for (mlir::scf::ForOp loop : be.dependent_loops) {
+        mlir::Value last_iv = mlir::arith::SubIOp::create(
+            builder, loc, loop.getUpperBound(), loop.getStep());
+        mlir::Value not_last = mlir::arith::CmpIOp::create(
+            builder, loc, mlir::arith::CmpIPredicate::ne,
+            loop.getInductionVar(), last_iv);
+        cond = cond ? mlir::arith::AndIOp::create(builder, loc, cond, not_last)
+                          .getResult()
+                    : not_last;
+      }
+      auto if_op = mlir::scf::IfOp::create(builder, loc, mlir::TypeRange{},
+                                           cond, /*withElseRegion=*/false);
       mlir::OpBuilder then_builder(
           if_op.getThenRegion().front().getTerminator());
       mlir::ktdf_lowering::SignalOp::create(then_builder, loc,
