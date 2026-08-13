@@ -83,12 +83,10 @@ namespace {
 // ---------------------------------------------------------------------------
 static void addScfForPipelineBackEdges(
     mlir::func::FuncOp func, mlir::ktdf::StageDependencyDAG& global_dag,
-    llvm::SmallVector<BackEdgeInfo>& back_edges_out) {
+    llvm::SmallVectorImpl<BackEdgeInfo>& back_edges_out) {
   func.walk([&](mlir::linalg::GenericOp generic) {
     // Step 1: find the immediately enclosing ktdf.stage (compute_stage).
-    mlir::Operation* p = generic->getParentOp();
-    while (p && !mlir::isa<mlir::ktdf::StageOp>(p)) p = p->getParentOp();
-    auto compute_stage = mlir::dyn_cast<mlir::ktdf::StageOp>(p);
+    auto compute_stage = generic->getParentOfType<mlir::ktdf::StageOp>();
     assert(compute_stage && "linalg.generic must be inside a ktdf.stage");
 
     // Step 2/3: walk up from compute_stage's parent pipeline looking for an
@@ -110,8 +108,7 @@ static void addScfForPipelineBackEdges(
     if (!enclosing_for) return;
 
     // Step 4: skip trivial loops (trip count known to be <= 1).
-    if (auto tc = scheduler::getStaticTripCount(enclosing_for); tc && *tc <= 1)
-      return;
+    if (auto tc = enclosing_for.getStaticTripCount(); tc && tc->ule(1)) return;
 
     // Steps 5+6: look up load_stage and store_stage directly from global_dag.
     // compute_stage is a leaf node in global_dag (no nested pipeline), so its
@@ -134,8 +131,7 @@ static void addScfForPipelineBackEdges(
     global_dag.successors[store_stage_op].push_back(load_stage_op);
     global_dag.predecessors[load_stage_op].push_back(store_stage_op);
 
-    back_edges_out.push_back(
-        BackEdgeInfo{store_stage_op, load_stage_op, enclosing_for});
+    back_edges_out.emplace_back(store_stage_op, load_stage_op, enclosing_for);
   });
 }
 

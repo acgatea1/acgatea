@@ -40,6 +40,10 @@ struct BackEdgeInfo {
   mlir::Operation* store_stage;  ///< leaf stage (producer, writes scratchpad)
   mlir::Operation* load_stage;   ///< root stage (consumer, reads scratchpad)
   mlir::scf::ForOp for_op;       ///< enclosing loop that carries the back-edge
+
+  BackEdgeInfo(mlir::Operation* store_stage, mlir::Operation* load_stage,
+               mlir::scf::ForOp for_op)
+      : store_stage(store_stage), load_stage(load_stage), for_op(for_op) {}
 };
 
 /// Insert signal operations for all scratchpad conflicts found in global_dag.
