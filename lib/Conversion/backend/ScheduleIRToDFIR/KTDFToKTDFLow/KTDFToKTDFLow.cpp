@@ -215,10 +215,8 @@ struct KTDFToKTDFLoweringPass
         return signalPassFailure();
       }
 
-      // Step 5: Wire queried units to stages
-      mlir::OpBuilder phase2_builder(func.getContext());
-
-      // Wire queried units from Step 4 to stages based on applicable_units
+      // Step 5: Wire queried units from Step 4 to stages based on
+      // applicable_units
       StageToUnitsMap stage_to_units;
       int wired_queries = 0;
       for (auto stage : stages) {
@@ -370,14 +368,14 @@ struct KTDFToKTDFLoweringPass
           }
 
           // Step 11: Transform stages to execute_on (inside-out: stages first)
-          if (mlir::failed(transformStagesToExecuteOn(
-                  pipeline, sorted_stages, stage_to_units, phase2_builder))) {
+          if (mlir::failed(transformStagesToExecuteOn(pipeline, sorted_stages,
+                                                      stage_to_units))) {
             return signalPassFailure();
           }
 
           // Step 12: Transform pipeline to execute_on (wrapping everything)
-          if (mlir::failed(transformPipelineToExecuteOn(
-                  pipeline, sorted_stages, stage_to_units, phase2_builder))) {
+          if (mlir::failed(transformPipelineToExecuteOn(pipeline, sorted_stages,
+                                                        stage_to_units))) {
             return signalPassFailure();
           }
 
