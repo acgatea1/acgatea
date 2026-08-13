@@ -319,7 +319,7 @@ struct KTDFToKTDFLoweringPass
       // before any pipeline transformation mutates the IR.  Back-edge signals
       // are wrapped in scf.if guards (iv != lb / iv != ub-step).
       if (mlir::failed(insertSignals(func.getLoc(), stage_to_units, global_dag,
-                                     conflicts, back_edges, phase2_builder))) {
+                                     conflicts, back_edges))) {
         return signalPassFailure();
       }
 

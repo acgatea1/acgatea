@@ -24,10 +24,10 @@
 #include "dataflow-scheduler/Conversion/backend/ScheduleIRToDFIR/KTDFToKTDFLow/StageToUnitsMap.h"
 #include "dataflow-scheduler/Dialect/KTDF/Analysis/GlobalStageDAG.h"
 #include "dataflow-scheduler/Utils/SchedulerExtContext.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/IR/Builders.h"
 #include "mlir/IR/Operation.h"
 
 namespace scheduler {
@@ -56,8 +56,7 @@ mlir::LogicalResult insertSignals(
     const mlir::ktdf::StageDependencyDAG& global_dag,
     const std::map<std::pair<mlir::Operation*, mlir::Operation*>,
                    llvm::SmallVector<scheduler::ResourceType, 2>>& conflicts,
-    const llvm::SmallVector<BackEdgeInfo>& back_edges,
-    mlir::OpBuilder& builder);
+    llvm::ArrayRef<BackEdgeInfo> back_edges);
 
 }  // namespace scheduler
 

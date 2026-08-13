@@ -78,8 +78,7 @@ mlir::LogicalResult scheduler::insertSignals(
     const mlir::ktdf::StageDependencyDAG& global_dag,
     const std::map<std::pair<mlir::Operation*, mlir::Operation*>,
                    llvm::SmallVector<scheduler::ResourceType, 2>>& conflicts,
-    const llvm::SmallVector<BackEdgeInfo>& back_edges,
-    mlir::OpBuilder& builder) {
+    llvm::ArrayRef<BackEdgeInfo> back_edges) {
   LDBG(1) << "Step 8: Insert signal operations";
 
   // Build a set of back-edge pairs so normal signal insertion can skip them —
@@ -100,6 +99,7 @@ mlir::LogicalResult scheduler::insertSignals(
           collectSignalUnits(producer_op, consumer_op, stage_to_units);
       if (!signal_units.empty()) {
         mlir::Operation* anchor = sharedLevelAncestor(producer_op, consumer_op);
+        mlir::OpBuilder builder(anchor);
         builder.setInsertionPointAfter(anchor);
         mlir::ktdf_lowering::SignalOp::create(builder, loc,
                                               mlir::ValueRange(signal_units));
@@ -127,7 +127,7 @@ mlir::LogicalResult scheduler::insertSignals(
     {
       auto load_stage = mlir::cast<mlir::ktdf::StageOp>(be.load_stage);
       mlir::Block* load_body = load_stage.getBody();
-      builder.setInsertionPointToStart(load_body);
+      mlir::OpBuilder builder(load_body, load_body->begin());
 
       mlir::Value not_first = mlir::arith::CmpIOp::create(
           builder, loc, mlir::arith::CmpIPredicate::ne, iv, lb);
@@ -144,7 +144,7 @@ mlir::LogicalResult scheduler::insertSignals(
     {
       auto store_stage = mlir::cast<mlir::ktdf::StageOp>(be.store_stage);
       mlir::Block* store_body = store_stage.getBody();
-      builder.setInsertionPoint(store_body, store_body->end());
+      mlir::OpBuilder builder(store_body, store_body->end());
 
       mlir::Value last_iv = mlir::arith::SubIOp::create(builder, loc, ub, step);
       mlir::Value not_last = mlir::arith::CmpIOp::create(
