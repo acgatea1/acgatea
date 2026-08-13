@@ -47,7 +47,6 @@
 #include "ktir/Dialect/KTDP/KTDP.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
-#include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -154,20 +153,25 @@ static llvm::SmallVector<mlir::scf::ForOp, 2> collectDependentLoops(
 
 // ---------------------------------------------------------------------------
 // Augment global_dag with cross-iteration back-edges and populate
-// back_edges_out for every pipeline whose linalg.generic compute stage has a
-// genuine scratchpad RAW dependency between its load and store stages.
+// back_edges_out for every pipeline that has a genuine scratchpad RAW
+// dependency between its load and store stages.
 //
-// For each linalg.generic, stageHasBackedgeDependency verifies that
-// store_stage actually writes to a memref that load_stage loads from before
-// recording the back-edge.  collectDependentLoops then walks the def-use
-// chains of the qualifying transfers to find all non-trivial loops whose IVs
-// index the scratchpad — these are stored in BackEdgeInfo as dependent_loops
-// and drive the multi-loop conjunction guards emitted by insertSignals.
-// If no dependent loops are found the candidate is skipped (no back-edge
-// needed).
+// Load and store stages are identified from the local token-chain topology of
+// each pipeline's direct child stages:
+//   - Load stage candidates: stages with no token predecessors (DAG sources).
+//   - Store stage candidates: stages with no token successors (DAG sinks).
+//
+// For each (load, store) source/sink pair, stageHasBackedgeDependency verifies
+// that store_stage actually writes to a memref that load_stage loads from
+// before recording the back-edge.  collectDependentLoops then walks the
+// def-use chains of the qualifying transfers to find all non-trivial loops
+// whose IVs index the scratchpad — these are stored in BackEdgeInfo as
+// dependent_loops and drive the multi-loop conjunction guards emitted by
+// insertSignals.  If no dependent loops are found the candidate is skipped
+// (no back-edge needed).
 //
 // The back-edge is:
-//   store_stage (token-successor of compute_stage) → load_stage (predecessor)
+//   store_stage → load_stage
 // injected into global_dag so computeScratchpadConflicts fires on the edge,
 // while back_edges_out lets insertSignals emit guarded signals instead of the
 // unconditional post-producer signal used for normal edges.
@@ -175,50 +179,62 @@ static llvm::SmallVector<mlir::scf::ForOp, 2> collectDependentLoops(
 static void addScfForPipelineBackEdges(
     mlir::func::FuncOp func, mlir::ktdf::StageDependencyDAG& global_dag,
     llvm::SmallVectorImpl<BackEdgeInfo>& back_edges_out) {
-  func.walk([&](mlir::linalg::GenericOp generic) {
-    // Step 1: find the immediately enclosing ktdf.stage (compute_stage).
-    auto compute_stage = generic->getParentOfType<mlir::ktdf::StageOp>();
-    assert(compute_stage && "linalg.generic must be inside a ktdf.stage");
+  func.walk([&](mlir::ktdf::PipelineOp pipeline) {
+    // Collect this pipeline's direct child stages.
+    llvm::SmallVector<mlir::ktdf::StageOp, 8> pipeline_stages;
+    for (auto& op : pipeline.getBodyRegion().front()) {
+      if (auto stage = mlir::dyn_cast<mlir::ktdf::StageOp>(op))
+        pipeline_stages.push_back(stage);
+    }
+    if (pipeline_stages.size() < 2) return;
 
-    // Step 2: look up load_stage and store_stage directly from global_dag.
-    // compute_stage is a leaf node in global_dag (no nested pipeline), so its
-    // predecessor entry is the load leaf stage and its successor is the store
-    // leaf stage.
-    mlir::Operation* compute_op = compute_stage.getOperation();
-
-    auto pred_it = global_dag.predecessors.find(compute_op);
-    if (pred_it == global_dag.predecessors.end() || pred_it->second.empty())
-      return;
-    auto* load_stage_op = pred_it->second.front();
-
-    auto succ_it = global_dag.successors.find(compute_op);
-    if (succ_it == global_dag.successors.end() || succ_it->second.empty())
-      return;
-    auto* store_stage_op = succ_it->second.front();
-
-    // Step 3: verify a genuine scratchpad dependency exists between the
-    // candidate load/store stage pair before committing the back-edge.
-    auto load_stage = mlir::cast<mlir::ktdf::StageOp>(load_stage_op);
-    auto store_stage = mlir::cast<mlir::ktdf::StageOp>(store_stage_op);
-    llvm::SmallVector<mlir::ktdf::DataTransferOp, 4> transfers_with_dependency;
-    if (!stageHasBackedgeDependency(load_stage, store_stage,
-                                    transfers_with_dependency))
+    // Build a local token-chain DAG for just the direct children of this
+    // pipeline so we can identify source and sink stages.
+    mlir::ktdf::StageDependencyDAG local_dag;
+    if (mlir::failed(
+            mlir::ktdf::analyzeStageDependencies(pipeline_stages, local_dag)))
       return;
 
-    // Step 4: derive the set of non-trivial loops that govern the scratchpad
-    // address by walking the def-use chains of the qualifying transfers.
-    llvm::SmallVector<mlir::scf::ForOp, 2> dependent_loops =
-        collectDependentLoops(transfers_with_dependency);
-    if (dependent_loops.empty()) return;
+    // Load stage candidates = DAG sources (no token predecessors).
+    // Store stage candidates = DAG sinks (no token successors).
+    llvm::SmallVector<mlir::ktdf::StageOp, 2> load_candidates, store_candidates;
+    for (auto stage : pipeline_stages) {
+      mlir::Operation* op = stage.getOperation();
+      auto& preds = local_dag.predecessors[op];
+      auto& succs = local_dag.successors[op];
+      if (preds.empty()) load_candidates.push_back(stage);
+      if (succs.empty()) store_candidates.push_back(stage);
+    }
 
-    LDBG(1) << "  Adding scf.for pipeline back-edge: store_stage -> "
-               "load_stage (cross-iteration scratchpad RAW)";
-    global_dag.successors[store_stage_op].push_back(load_stage_op);
-    global_dag.predecessors[load_stage_op].push_back(store_stage_op);
+    // Check every (load, store) candidate pair for a genuine cross-iteration
+    // scratchpad dependency and record a back-edge if one is found.
+    for (auto load_stage : load_candidates) {
+      for (auto store_stage : store_candidates) {
+        if (load_stage == store_stage) continue;
 
-    back_edges_out.emplace_back(store_stage_op, load_stage_op,
-                                std::move(dependent_loops),
-                                std::move(transfers_with_dependency));
+        mlir::Operation* load_stage_op = load_stage.getOperation();
+        mlir::Operation* store_stage_op = store_stage.getOperation();
+
+        llvm::SmallVector<mlir::ktdf::DataTransferOp, 4>
+            transfers_with_dependency;
+        if (!stageHasBackedgeDependency(load_stage, store_stage,
+                                        transfers_with_dependency))
+          continue;
+
+        llvm::SmallVector<mlir::scf::ForOp, 2> dependent_loops =
+            collectDependentLoops(transfers_with_dependency);
+        if (dependent_loops.empty()) continue;
+
+        LDBG(1) << "  Adding scf.for pipeline back-edge: store_stage -> "
+                   "load_stage (cross-iteration scratchpad RAW)";
+        global_dag.successors[store_stage_op].push_back(load_stage_op);
+        global_dag.predecessors[load_stage_op].push_back(store_stage_op);
+
+        back_edges_out.emplace_back(store_stage_op, load_stage_op,
+                                    std::move(dependent_loops),
+                                    std::move(transfers_with_dependency));
+      }
+    }
   });
 }
 
