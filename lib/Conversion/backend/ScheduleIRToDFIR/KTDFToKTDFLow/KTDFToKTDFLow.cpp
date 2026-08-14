@@ -105,14 +105,17 @@ static bool stageHasBackedgeDependency(
 }
 
 // ---------------------------------------------------------------------------
-// Walk the def-use chains of each transfer in transfers_with_dependency and
-// collect the distinct non-trivial scf.for loops whose induction variables
-// appear as BlockArguments in those chains.
+// Walk the def-use chains of each transfer and collect the distinct
+// non-trivial scf.for loops whose induction variables appear as
+// BlockArguments in those chains.
 //
 // Algorithm:
-//   - Maintain a worklist of Values, seeded with the index operands of each
-//     qualifying transfer (not the destination memref — only the address
-//     computation operands can reveal which loop IVs govern the scratchpad).
+//   - Maintain a worklist of Values, seeded with:
+//       * the source indices of each load-stage transfer (scratchpad read
+//         address), and
+//       * the dest indices of each store-stage transfer (scratchpad write
+//         address) — these may involve additional loop IVs that must also
+//         contribute guards.
 //   - For each Value: if it is a BlockArgument that is the induction variable
 //     of an scf.for, record that ForOp (once) unless its static trip count
 //     is <= 1.
@@ -120,14 +123,17 @@ static bool stageHasBackedgeDependency(
 //     the worklist to follow the chain transitively.
 // ---------------------------------------------------------------------------
 static llvm::SmallVector<mlir::scf::ForOp, 2> collectDependentLoops(
-    llvm::ArrayRef<mlir::ktdf::DataTransferOp> transfers_with_dependency) {
+    llvm::ArrayRef<mlir::ktdf::DataTransferOp> load_transfers,
+    llvm::ArrayRef<mlir::ktdf::DataTransferOp> store_transfers) {
   llvm::SmallVector<mlir::scf::ForOp, 2> result;
   llvm::DenseSet<mlir::Block*> seen_blocks;
   llvm::DenseSet<mlir::Value> visited;
   llvm::SmallVector<mlir::Value> worklist;
 
-  for (mlir::ktdf::DataTransferOp xfer : transfers_with_dependency)
+  for (mlir::ktdf::DataTransferOp xfer : load_transfers)
     for (mlir::Value idx : xfer.getSourceIndices()) worklist.push_back(idx);
+  for (mlir::ktdf::DataTransferOp xfer : store_transfers)
+    for (mlir::Value idx : xfer.getDestIndices()) worklist.push_back(idx);
 
   while (!worklist.empty()) {
     mlir::Value v = worklist.pop_back_val();
@@ -221,8 +227,19 @@ static void addScfForPipelineBackEdges(
                                         transfers_with_dependency))
           continue;
 
+        // Collect store-stage transfers that write to a non-FIFO destination
+        // (scratchpad write-back).
+        // TODO: this considers all non-FIFO store transfers, even those whose
+        // destination memref has no dependency with load_stage.  A tighter
+        // filter would restrict to transfers whose dest memref matches one of
+        // the sources in transfers_with_dependency.
+        llvm::SmallVector<mlir::ktdf::DataTransferOp, 4> store_transfers;
+        store_stage.walk([&](mlir::ktdf::DataTransferOp xfer) {
+          if (!xfer.isDestFifo()) store_transfers.push_back(xfer);
+        });
+
         llvm::SmallVector<mlir::scf::ForOp, 2> dependent_loops =
-            collectDependentLoops(transfers_with_dependency);
+            collectDependentLoops(transfers_with_dependency, store_transfers);
         if (dependent_loops.empty()) continue;
 
         LDBG(1) << "  Adding scf.for pipeline back-edge: store_stage -> "
