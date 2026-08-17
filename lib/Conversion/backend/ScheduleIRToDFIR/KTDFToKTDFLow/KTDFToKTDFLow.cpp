@@ -105,28 +105,32 @@ static bool stageHasBackedgeDependency(
 }
 
 // ---------------------------------------------------------------------------
-// Walk the def-use chains of each transfer and collect the distinct
-// non-trivial scf.for loops whose induction variables appear as
-// BlockArguments in those chains.
-//
-// Algorithm:
-//   - Maintain a worklist of Values, seeded with:
-//       * the source indices of each load-stage transfer (scratchpad read
-//         address), and
-//       * the dest indices of each store-stage transfer (scratchpad write
-//         address) — these may involve additional loop IVs that must also
-//         contribute guards.
-//   - For each Value: if it is a BlockArgument that is the induction variable
-//     of an scf.for, record that ForOp (once) unless its static trip count
-//     is <= 1.
-//   - If it is an Operation result, push all operands of the defining op onto
-//     the worklist to follow the chain transitively.
+// Collect the scf.for loops that are ancestors of `pipeline` up to (but not
+// including) the enclosing ktdf.parallel (or the function root if there is
+// none).
+// ---------------------------------------------------------------------------
+static llvm::DenseSet<mlir::Operation*> collectAncestorLoopsInsideParallel(
+    mlir::ktdf::PipelineOp pipeline) {
+  llvm::DenseSet<mlir::Operation*> loops;
+  for (mlir::Operation* p = pipeline->getParentOp(); p; p = p->getParentOp()) {
+    if (mlir::isa<mlir::ktdf::ParallelOp>(p)) break;
+    if (mlir::isa<mlir::scf::ForOp>(p)) loops.insert(p);
+  }
+  return loops;
+}
+
+// ---------------------------------------------------------------------------
+// Walk the def-use chains of each transfer's indices and collect the distinct
+// scf.for loops whose induction variables appear in those chains, restricted
+// to loops in `allowed_loops` (ancestor loops of the enclosing pipeline up
+// to the nearest ktdf.parallel).
 // ---------------------------------------------------------------------------
 static llvm::SmallVector<mlir::scf::ForOp, 2> collectDependentLoops(
     llvm::ArrayRef<mlir::ktdf::DataTransferOp> load_transfers,
-    llvm::ArrayRef<mlir::ktdf::DataTransferOp> store_transfers) {
+    llvm::ArrayRef<mlir::ktdf::DataTransferOp> store_transfers,
+    const llvm::DenseSet<mlir::Operation*>& allowed_loops) {
   llvm::SmallVector<mlir::scf::ForOp, 2> result;
-  llvm::DenseSet<mlir::Block*> seen_blocks;
+  llvm::DenseSet<mlir::Operation*> seen;
   llvm::DenseSet<mlir::Value> visited;
   llvm::SmallVector<mlir::Value> worklist;
 
@@ -140,14 +144,12 @@ static llvm::SmallVector<mlir::scf::ForOp, 2> collectDependentLoops(
     if (!visited.insert(v).second) continue;
 
     if (auto block_arg = mlir::dyn_cast<mlir::BlockArgument>(v)) {
-      mlir::Block* owner = block_arg.getOwner();
-      if (!seen_blocks.insert(owner).second) continue;
-      auto for_op =
-          mlir::dyn_cast_or_null<mlir::scf::ForOp>(owner->getParentOp());
+      mlir::Operation* parent = block_arg.getOwner()->getParentOp();
+      auto for_op = mlir::dyn_cast_or_null<mlir::scf::ForOp>(parent);
       if (!for_op) continue;
       if (for_op.getInductionVar() != v) continue;
-      // Discard trivial loops (trip count statically known to be <= 1).
-      if (auto tc = for_op.getStaticTripCount(); tc && tc->ule(1)) continue;
+      if (!allowed_loops.count(for_op.getOperation())) continue;
+      if (!seen.insert(for_op.getOperation()).second) continue;
       result.push_back(for_op);
     } else if (mlir::Operation* def = v.getDefiningOp()) {
       for (mlir::Value operand : def->getOperands())
@@ -238,8 +240,11 @@ static void addScfForPipelineBackEdges(
           if (!xfer.isDestFifo()) store_transfers.push_back(xfer);
         });
 
+        llvm::DenseSet<mlir::Operation*> allowed_loops =
+            collectAncestorLoopsInsideParallel(pipeline);
         llvm::SmallVector<mlir::scf::ForOp, 2> dependent_loops =
-            collectDependentLoops(transfers_with_dependency, store_transfers);
+            collectDependentLoops(transfers_with_dependency, store_transfers,
+                                  allowed_loops);
         if (dependent_loops.empty()) continue;
 
         LDBG(1) << "  Adding scf.for pipeline back-edge: store_stage -> "
