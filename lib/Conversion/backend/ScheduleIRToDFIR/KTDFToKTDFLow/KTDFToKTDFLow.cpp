@@ -122,13 +122,26 @@ static llvm::DenseSet<mlir::Operation*> collectAncestorLoopsInsideParallel(
 // ---------------------------------------------------------------------------
 // Walk the def-use chains of each transfer's indices and collect the distinct
 // scf.for loops whose induction variables appear in those chains, restricted
-// to loops in `allowed_loops` (ancestor loops of the enclosing pipeline up
+// to loops in `ancestor_loops` (ancestor loops of the enclosing pipeline up
 // to the nearest ktdf.parallel).
+//
+// Algorithm:
+//   - Maintain a worklist of Values, seeded with:
+//       * the source indices of each load-stage transfer (scratchpad read
+//         address), and
+//       * the dest indices of each store-stage transfer (scratchpad write
+//         address) — these may involve additional loop IVs that must also
+//         contribute guards.
+//   - For each Value: if it is a BlockArgument that is the induction variable
+//     of an scf.for in ancestor_loops, record that ForOp (once) unless
+//     its static trip count is <= 1.
+//   - If it is an Operation result, push all operands of the defining op onto
+//     the worklist to follow the chain transitively.
 // ---------------------------------------------------------------------------
 static llvm::SmallVector<mlir::scf::ForOp, 2> collectDependentLoops(
     llvm::ArrayRef<mlir::ktdf::DataTransferOp> load_transfers,
     llvm::ArrayRef<mlir::ktdf::DataTransferOp> store_transfers,
-    const llvm::DenseSet<mlir::Operation*>& allowed_loops) {
+    const llvm::DenseSet<mlir::Operation*>& ancestor_loops) {
   llvm::SmallVector<mlir::scf::ForOp, 2> result;
   llvm::DenseSet<mlir::Operation*> seen;
   llvm::DenseSet<mlir::Value> visited;
@@ -148,7 +161,9 @@ static llvm::SmallVector<mlir::scf::ForOp, 2> collectDependentLoops(
       auto for_op = mlir::dyn_cast_or_null<mlir::scf::ForOp>(parent);
       if (!for_op) continue;
       if (for_op.getInductionVar() != v) continue;
-      if (!allowed_loops.count(for_op.getOperation())) continue;
+      // Discard trivial loops (trip count statically known to be <= 1).
+      if (auto tc = for_op.getStaticTripCount(); tc && tc->ule(1)) continue;
+      if (!ancestor_loops.count(for_op.getOperation())) continue;
       if (!seen.insert(for_op.getOperation()).second) continue;
       result.push_back(for_op);
     } else if (mlir::Operation* def = v.getDefiningOp()) {
@@ -240,11 +255,11 @@ static void addScfForPipelineBackEdges(
           if (!xfer.isDestFifo()) store_transfers.push_back(xfer);
         });
 
-        llvm::DenseSet<mlir::Operation*> allowed_loops =
+        llvm::DenseSet<mlir::Operation*> ancestor_loops =
             collectAncestorLoopsInsideParallel(pipeline);
         llvm::SmallVector<mlir::scf::ForOp, 2> dependent_loops =
             collectDependentLoops(transfers_with_dependency, store_transfers,
-                                  allowed_loops);
+                                  ancestor_loops);
         if (dependent_loops.empty()) continue;
 
         LDBG(1) << "  Adding scf.for pipeline back-edge: store_stage -> "
