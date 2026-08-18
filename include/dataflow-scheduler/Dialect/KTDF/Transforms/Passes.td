@@ -72,6 +72,15 @@ def StageCoarseningPass : Pass<"stage-coarsening", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::ktdf::KTDFDialect"];
 }
 
+def SplitReductionInnerOuterDimPass : Pass<"split-reduction-inner-outer-dim", "mlir::ModuleOp"> {
+  let summary = "Split the inner and outer dimensions of a reduction";
+  let description = [{
+    Placeholder pass — not yet implemented.
+  }];
+  let constructor = "::mlir::ktdf::createSplitReductionInnerOuterDimPass()";
+  let dependentDialects = ["mlir::ktdf::KTDFDialect"];
+}
+
 def ReductionLoopExposurePass : Pass<"reduction-loop-exposure", "mlir::ModuleOp"> {
   let summary = "Expose the reduction loop of a linalg.generic as an explicit scf.for with a loop-carry accumulator";
   let description = [{

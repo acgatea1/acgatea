@@ -7,6 +7,7 @@ add_dataflow_scheduler_library(DataflowSchedulerKTDFTransforms
     ReductionDimChunking.cpp
     ReductionUtils.cpp
     ReductionLoopExposure.cpp
+    SplitReductionInnerOuterDim.cpp
     StageCoarsening.cpp
     SubsumeLinearizeIndex.cpp
     TileNormalized.cpp
