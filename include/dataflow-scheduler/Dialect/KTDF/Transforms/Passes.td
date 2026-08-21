@@ -75,10 +75,17 @@ def StageCoarseningPass : Pass<"stage-coarsening", "mlir::ModuleOp"> {
 def SplitReductionInnerOuterDimPass : Pass<"split-reduction-inner-outer-dim", "mlir::ModuleOp"> {
   let summary = "Split the inner and outer dimensions of a reduction";
   let description = [{
-    Placeholder pass — not yet implemented.
+    Walks the module for linalg.generic ops with at least one reduction
+    iterator and splits each reduction dimension into an inner dimension of
+    size vector_length (derived from the hardware SIMD feature) and an outer
+    dimension of size reduction_dim / vector_length.
   }];
   let constructor = "::mlir::ktdf::createSplitReductionInnerOuterDimPass()";
-  let dependentDialects = ["mlir::ktdf::KTDFDialect"];
+  let dependentDialects = [
+    "mlir::ktdf::KTDFDialect",
+    "mlir::linalg::LinalgDialect",
+    "mlir::tensor::TensorDialect"
+  ];
 }
 
 def ReductionLoopExposurePass : Pass<"reduction-loop-exposure", "mlir::ModuleOp"> {
