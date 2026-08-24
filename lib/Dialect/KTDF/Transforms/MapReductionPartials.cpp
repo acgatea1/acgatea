@@ -16,9 +16,10 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// MapReductionPartials: lower reduction linalg.generic ops whose first input
-// comes from a ktdf.read_from_fifo to buffer-semantics form backed by a
-// pre-allocated accumulator memref.
+// MapReductionPartials: lower reduction linalg.generic ops to buffer-semantics
+// form backed by pre-allocated memrefs.  Two kinds of generics are handled:
+//
+// ── Across-stick generic (loop-exposed by ReductionLoopExposure) ─────────────
 //
 // After ReductionLoopExposure the compute stage looks like:
 //
@@ -55,6 +56,27 @@
 // The iter_arg / loop result / scf.yield operand are stripped, and any
 // write_to_fifo that consumed the loop result is patched to use %alloc.
 //
+// ── In-stick generic (produced by SplitReductionInnerOuterDim) ───────────────
+//
+// After the across-stick rewrite above, %alloc_G1 (memref<CxDxf16, ms>) has
+// been RAUW'd in place of the loop result, so the in-stick generic sees:
+//
+//   %empty = tensor.empty() : tensor<Cxf16>
+//   %result = linalg.generic ins(%alloc_G1: memref<CxDxf16, ms>)
+//                            outs(%empty: tensor<Cxf16>)
+//   ktdf.write_to_fifo %result, %fifo_out
+//
+// %alloc_G1 is reused as the output buffer.  A rank-reducing subview with
+// all-zero offsets, sizes = original size on parallel dims / 1 on reduction
+// dims, and all-one strides is created and used as both ins and outs of the
+// buffer linalg.generic.  The reduced result is written back into %alloc_G1
+// via the subview, and %alloc_G1 is then written to the FIFO.
+//
+//   %sv = memref.subview %alloc_G1[0,...][C,1,...][1,...]
+//             : memref<CxDxf16, ms> to memref<Cxf16, strided<[D]>, ms>
+//   linalg.generic ins(%alloc_G1) outs(%sv)  {original maps & iter_types}
+//   ktdf.write_to_fifo %alloc_G1, %fifo_out
+//
 //===----------------------------------------------------------------------===//
 
 #include <memory>
@@ -69,6 +91,7 @@
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/AffineMap.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -405,6 +428,116 @@ static LogicalResult rewriteGeneric(
   return success();
 }
 
+// ---------------------------------------------------------------------------
+// Lower an in-stick reduction linalg.generic to buffer semantics.
+//
+// At this point (after rewriteGeneric has run on G1) the stage contains:
+//
+//   %result = linalg.generic ins(%alloc_G1: memref<CxDxf16, ms>)
+//                            outs(%empty:   tensor<Cxf16>)
+//   ktdf.write_to_fifo %result, %fifo_out
+//
+// %alloc_G1 is already a memref (RAUW'd by rewriteGeneric).  We reuse it as
+// both input and output buffer:
+//
+//   ins  = %alloc_G1 (full memref<CxDxf16>) — rank matches the original ins
+//          map, no change needed.
+//   outs = a rank-reducing subview of %alloc_G1 with size=1 on all reduction
+//          dims (rank-reduced away) and original size on parallel dims.  This
+//          gives memref<Cxf16, strided<[D]>> — a view into the first column
+//          of %alloc_G1 where the reduced results are written back in-place.
+//
+// The original indexing maps are preserved unchanged: the ins map operates
+// over the full rank-2 input, the outs map projects onto the rank-1 subview.
+// After the reduction, %alloc_G1 is written to the FIFO (the results live at
+// alloc_G1[i, 0] with stride D, matching what the subview exposed).
+//
+//   %sv = memref.subview %alloc_G1[0,...][C,1,...][1,...]
+//             : memref<CxDxf16, ms> to memref<Cxf16, strided<[D]>, ms>
+//   linalg.generic ins(%alloc_G1) outs(%sv)  {original maps & iter_types}
+//   ktdf.write_to_fifo %alloc_G1, %fifo_out
+// ---------------------------------------------------------------------------
+static LogicalResult rewriteInStickGeneric(linalg::GenericOp generic_op) {
+  auto stage = generic_op->getParentOfType<ktdf::StageOp>();
+  assert(stage && "expected enclosing ktdf.stage");
+
+  OpBuilder builder(generic_op);
+  Location loc = generic_op.getLoc();
+
+  // ins[0] is already a memref — the across-stick alloc from rewriteGeneric.
+  Value alloc_in = generic_op.getInputs()[0];
+  auto in_memref_type = cast<MemRefType>(alloc_in.getType());
+  unsigned in_rank = in_memref_type.getRank();
+
+  // Inspect input indexing map and iterator types to classify each input dim.
+  auto iter_types = generic_op.getIteratorTypesArray();
+  AffineMap in_map = generic_op.getIndexingMapsArray().front();
+  ArrayRef<int64_t> in_shape = in_memref_type.getShape();
+
+  // Build subview sizes: 1 on reduction dims (rank-reduced away), original
+  // size on parallel dims.  Offsets and strides are all 0/1.
+  SmallVector<int64_t> sv_sizes(in_rank);
+  for (unsigned d = 0; d < in_rank; ++d) {
+    auto dim_expr = dyn_cast<AffineDimExpr>(in_map.getResult(d));
+    assert(dim_expr && "in-stick input map must be identity-like");
+    unsigned loop_dim = dim_expr.getPosition();
+    sv_sizes[d] = (iter_types[loop_dim] == utils::IteratorType::reduction)
+                      ? 1
+                      : in_shape[d];
+  }
+
+  SmallVector<OpFoldResult> sv_offsets(in_rank, builder.getIndexAttr(0));
+  SmallVector<OpFoldResult> sv_sizes_ofr;
+  for (int64_t sz : sv_sizes) sv_sizes_ofr.push_back(builder.getIndexAttr(sz));
+  SmallVector<OpFoldResult> sv_strides(in_rank, builder.getIndexAttr(1));
+
+  // Rank-reduced result shape: drop all size-1 (reduction) dims.
+  SmallVector<int64_t> sv_result_shape;
+  for (int64_t sz : sv_sizes)
+    if (sz != 1) sv_result_shape.push_back(sz);
+
+  // Let SubViewOp infer the correct strided layout from the source memref.
+  auto sv_result_type =
+      cast<MemRefType>(memref::SubViewOp::inferRankReducedResultType(
+          sv_result_shape, in_memref_type, sv_offsets, sv_sizes_ofr,
+          sv_strides));
+
+  auto subview =
+      memref::SubViewOp::create(builder, loc, sv_result_type, alloc_in,
+                                sv_offsets, sv_sizes_ofr, sv_strides);
+
+  // Buffer linalg.generic: ins = full alloc_in (rank-2), outs = rank-1
+  // subview.  Original maps and iterator_types are preserved — they already
+  // express the correct ins/outs rank relationship.
+  auto buf_generic = linalg::GenericOp::create(
+      builder, loc,
+      /*resultTensorTypes=*/TypeRange{},
+      /*inputs=*/ValueRange{alloc_in},
+      /*outputs=*/ValueRange{subview.getResult()},
+      generic_op.getIndexingMapsAttr(), generic_op.getIteratorTypesAttr(),
+      /*doc=*/StringAttr{},
+      /*library_call=*/StringAttr{});
+  IRMapping mapping;
+  generic_op.getRegion().cloneInto(&buf_generic.getRegion(), mapping);
+  Block& placeholder = buf_generic.getRegion().front();
+  if (&placeholder != &buf_generic.getRegion().back()) placeholder.erase();
+
+  // Patch write_to_fifo to use the subview (2 elements, matching the FIFO).
+  Value generic_result = generic_op.getResult(0);
+  for (Operation* user : llvm::make_early_inc_range(generic_result.getUsers()))
+    if (auto write_op = dyn_cast<ktdf::WriteToFifoOp>(user))
+      write_op.getDataMutable().assign(subview.getResult());
+  generic_result.replaceAllUsesWith(subview.getResult());
+
+  // Erase the original tensor.empty output initializer and the tensor generic.
+  Value orig_out_init = generic_op.getDpsInitOperand(0)->get();
+  generic_op.erase();
+  if (orig_out_init.use_empty())
+    if (auto* def = orig_out_init.getDefiningOp()) def->erase();
+
+  return success();
+}
+
 struct MapReductionPartialsPass
     : public ktdf::impl::MapReductionPartialsPassBase<
           MapReductionPartialsPass> {
@@ -427,13 +560,29 @@ struct MapReductionPartialsPass
         device_manager.getOrCreateView<scheduler::arch_view::GroupLocalMemory>(
             *device);
 
-    SmallVector<linalg::GenericOp> candidates;
+    // Collect generics in two buckets.  Loop-exposed (across-stick) generics
+    // must be processed first so their loop results are RAUW'd to alloc
+    // memrefs before the in-stick generics are processed (which expect ins[0]
+    // to already be a memref).
+    SmallVector<linalg::GenericOp> loop_exposed, in_stick;
     module.walk([&](linalg::GenericOp generic_op) {
-      if (hasReductionIterator(generic_op)) candidates.push_back(generic_op);
+      if (!hasReductionIterator(generic_op)) return;
+      if (generic_op.getOutputs().empty()) return;
+      auto iter_arg = dyn_cast<BlockArgument>(generic_op.getOutputs()[0]);
+      if (iter_arg && isa<scf::ForOp>(iter_arg.getOwner()->getParentOp()))
+        loop_exposed.push_back(generic_op);
+      else
+        in_stick.push_back(generic_op);
     });
 
-    for (auto generic_op : candidates) {
+    for (auto generic_op : loop_exposed) {
       if (failed(rewriteGeneric(generic_op, group_local_mem))) {
+        signalPassFailure();
+        return;
+      }
+    }
+    for (auto generic_op : in_stick) {
+      if (failed(rewriteInStickGeneric(generic_op))) {
         signalPassFailure();
         return;
       }
