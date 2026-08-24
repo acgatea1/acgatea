@@ -90,22 +90,12 @@ static llvm::cl::opt<bool> DisableThisPass(
 
 namespace {
 
+// Return true if `token` appears in the depends_in list of `stage`.
 // ---------------------------------------------------------------------------
-// Return the first linalg.generic with a reduction iterator found anywhere
-// inside `stage`, or null if none exists.
-// ---------------------------------------------------------------------------
-linalg::GenericOp findReductionGenericOp(ktdf::StageOp stage) {
-  linalg::GenericOp found;
-  stage.getBody()->walk([&](linalg::GenericOp generic) {
-    for (auto it : generic.getIteratorTypesArray()) {
-      if (it == utils::IteratorType::reduction) {
-        found = generic;
-        return WalkResult::interrupt();
-      }
-    }
-    return WalkResult::advance();
-  });
-  return found;
+bool stageConsumesToken(ktdf::StageOp stage, Value token) {
+  for (Value dep : stage.getDependsIn())
+    if (dep == token) return true;
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -118,21 +108,57 @@ struct ReductionInfo {
 };
 
 // ---------------------------------------------------------------------------
+// Return the loop dimension index that maps to the rightmost non-size-1 input
+// dimension of `generic_op`, if that loop dimension is a reduction.  This is
+// the in-stick dimension that must not be exposed as a loop by this pass.
+// ---------------------------------------------------------------------------
+static std::optional<unsigned> findInStickLoopDim(
+    linalg::GenericOp generic_op) {
+  auto iter_types = generic_op.getIteratorTypesArray();
+  auto input_type =
+      dyn_cast<RankedTensorType>(generic_op.getInputs().front().getType());
+  if (!input_type) return std::nullopt;
+
+  AffineMap input_map = generic_op.getIndexingMapsArray().front();
+  ArrayRef<int64_t> shape = input_type.getShape();
+
+  for (int64_t d = static_cast<int64_t>(shape.size()) - 1; d >= 0; --d) {
+    if (shape[d] == 1) continue;
+    auto dim_expr = dyn_cast<AffineDimExpr>(input_map.getResult(d));
+    if (!dim_expr) return std::nullopt;
+    unsigned loop_dim = dim_expr.getPosition();
+    if (iter_types[loop_dim] == utils::IteratorType::reduction) return loop_dim;
+    return std::nullopt;  // rightmost non-1 dim is parallel — no in-stick
+  }
+  return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
 // Fill `info` with the reduction dimensions and sizes derived from
-// `generic_op`.  Returns true on success.  Returns false (and emits a
-// diagnostic or debug message) when:
-//   - there are no reduction dimensions, or
-//   - any reduction dimension has a dynamic size.
+// `generic_op`, excluding the in-stick (innermost) reduction dimension so
+// that it is left for later handling by the ktdf.opaque wrapping pass.
+// Returns true on success.  Returns false (and emits a diagnostic or debug
+// message) when:
+//   - there are no across-stick reduction dimensions to expose, or
+//   - any qualifying reduction dimension has a dynamic size.
 // ---------------------------------------------------------------------------
 static bool collectReductionInfo(linalg::GenericOp generic_op,
                                  ReductionInfo& info) {
+  std::optional<unsigned> in_stick_dim = findInStickLoopDim(generic_op);
+
   auto iter_types = generic_op.getIteratorTypesArray();
-  for (int64_t i = 0; i < static_cast<int64_t>(iter_types.size()); ++i)
-    if (iter_types[i] == utils::IteratorType::reduction)
-      info.reduction_dims.push_back(i);
+  for (int64_t i = 0; i < static_cast<int64_t>(iter_types.size()); ++i) {
+    if (iter_types[i] != utils::IteratorType::reduction) continue;
+    if (in_stick_dim && static_cast<unsigned>(i) == *in_stick_dim) {
+      LDBG(1) << PASS_NAME ": skipping in-stick reduction dim " << i;
+      continue;
+    }
+    info.reduction_dims.push_back(i);
+  }
 
   if (info.reduction_dims.empty()) {
-    generic_op.emitError(PASS_NAME ": reduction dim not found");
+    LDBG(1) << PASS_NAME
+        ": no across-stick reduction dims to expose — skipping";
     return false;
   }
 
@@ -157,6 +183,26 @@ static bool collectReductionInfo(linalg::GenericOp generic_op,
   LDBG(1) << "] total_reduction_size=" << info.reduction_size;
 
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// Collect all linalg.generic ops directly inside `stage` that have across-stick
+// reduction dims to expose (i.e. collectReductionInfo succeeds for them).
+// In-stick-only generics are excluded — they are left for a later
+// opaque-generating pass.
+// ---------------------------------------------------------------------------
+static void collectReductionGenericOps(
+    ktdf::StageOp stage, SmallVectorImpl<linalg::GenericOp>& result) {
+  // PreOrder so we see a nested ktdf.stage before its children, allowing
+  // WalkResult::skip() to prevent descent into a different pipeline.
+  stage.getBody()->walk<WalkOrder::PreOrder>([&](Operation* op) {
+    if (isa<ktdf::StageOp>(op)) return WalkResult::skip();
+    if (auto generic = dyn_cast<linalg::GenericOp>(op)) {
+      ReductionInfo info;
+      if (collectReductionInfo(generic, info)) result.push_back(generic);
+    }
+    return WalkResult::advance();
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -391,46 +437,41 @@ struct ReductionLoopExposurePass
 
  private:
   // -------------------------------------------------------------------------
-  // Collect every ktdf.stage that directly holds a reduction linalg.generic
-  // (i.e. the generic is at some depth inside the stage body), then rewrite
-  // the parent pipeline of each such stage.  We collect first to avoid
-  // walking ops that we are about to rewrite.
+  // Collect every (stage, generic) pair where the generic has across-stick
+  // reduction dims to expose, then rewrite each.
+  //
+  // Post-order walk ensures inner stages are processed before outer ones.
+  // This matters because rewriting an outer stage splices its body into new
+  // scf.for loops (cloning contents), so any inner generic must already be
+  // in its final form before the outer rewrite runs.
   // -------------------------------------------------------------------------
   LogicalResult transformModule(ModuleOp module) {
-    // Use a DenseSet to avoid O(n²) duplicate checks.
-    llvm::DenseSet<ktdf::StageOp> seen;
-    SmallVector<ktdf::StageOp> compute_stages;
-    module.walk([&](linalg::GenericOp generic) {
-      // Check if this generic has a reduction iterator.
-      bool has_reduction = false;
-      for (auto it : generic.getIteratorTypesArray())
-        if (it == utils::IteratorType::reduction) {
-          has_reduction = true;
-          break;
-        }
-      if (!has_reduction) return WalkResult::advance();
-
-      // linalg.generic must always be directly nested inside a ktdf.stage.
-      auto stage = generic->getParentOfType<ktdf::StageOp>();
-      assert(stage && "linalg.generic must be nested inside a ktdf.stage");
-
-      if (seen.insert(stage).second) compute_stages.push_back(stage);
+    // Collect (stage, generic) pairs in post-order so inner pipelines come
+    // before outer ones.  Rewriting happens after the walk completes to avoid
+    // iterator invalidation from mutations made during traversal.
+    SmallVector<std::pair<ktdf::StageOp, linalg::GenericOp>> work_items;
+    module.walk<WalkOrder::PostOrder>([&](ktdf::StageOp stage) {
+      SmallVector<linalg::GenericOp> generics;
+      collectReductionGenericOps(stage, generics);
+      for (auto generic : generics) work_items.emplace_back(stage, generic);
       return WalkResult::advance();
     });
 
-    for (auto compute_stage : compute_stages)
-      if (failed(rewritePipeline(compute_stage))) return failure();
+    // Process inner pipelines first (guaranteed by post-order collection).
+    // Each generic is valid at the time its rewrite runs because inner rewrites
+    // only mutate their own pipeline's stages, not the enclosing ones.
+    for (auto& [stage, generic] : work_items)
+      if (failed(rewritePipeline(stage, generic))) return failure();
 
     return success();
   }
 
   // -------------------------------------------------------------------------
-  // Rewrite the ktdf.pipeline that contains `compute_stage`.
+  // Rewrite the ktdf.pipeline that contains `compute_stage` for the given
+  // `generic_op` (which has across-stick reduction dims to expose).
   // -------------------------------------------------------------------------
-  LogicalResult rewritePipeline(ktdf::StageOp compute_stage) {
-    linalg::GenericOp generic_op = findReductionGenericOp(compute_stage);
-    if (!generic_op) return success();  // already removed?
-
+  LogicalResult rewritePipeline(ktdf::StageOp compute_stage,
+                                linalg::GenericOp generic_op) {
     // --- Collect per-dimension reduction sizes ---
     // Each reduction dimension gets its own scf.for loop.  The total shrink
     // factor R = product(dim_sizes[]) is used only for FIFO resizing.

@@ -93,33 +93,40 @@ def ReductionLoopExposurePass : Pass<"reduction-loop-exposure", "mlir::ModuleOp"
   let description = [{
     Walks the module for any ktdf.stage that contains a linalg.generic with a
     reduction iterator (the Compute stage).  For each one found it rewrites the
-    parent ktdf.pipeline so that the reduction becomes one nested scf.for loop
-    per reduction dimension, with the accumulator tensor threaded as iter_args.
+    parent ktdf.pipeline so that the across-stick reduction becomes one nested
+    scf.for loop per reduction dimension, with the accumulator tensor threaded
+    as iter_args.
+
+    The in-stick (innermost) reduction dimension — identified as the reduction
+    loop dim that maps to the rightmost non-size-1 input tensor dimension — is
+    excluded from loop exposure and left as-is for later handling by the
+    ktdf.opaque wrapping pass.
 
     The pass may be composed with ReductionDimChunking.  When the input has
     already been chunked, the Load stage body contains a scf.if that feeds
     the previous chunk's partial result into fifo_partial on non-first
     iterations; the pass preserves that scf.if outside the new reduction loop.
 
-    Before (R_i = size of reduction dimension i; C = non-reduction elements):
+    Before (R_i = size of across-stick reduction dimension i; S = in-stick
+    reduction size; C = non-reduction elements):
 
-      ktdf.private: [fifo_in(R_0*...*R_n*C elements), fifo_out(C elements), ...]
+      ktdf.private: [fifo_in(R_0*...*R_n*C*S elements), fifo_out(C*S elements), ...]
 
-      Load stage:    data_transfer  src -> fifo_in   (full R_0*...*R_n*C slice)
-      Compute stage: read_from_fifo fifo_in -> tensor<..xR_0x..xR_nxCxf16>
-                     linalg.generic (reduction) -> tensor<..xCxf16>
+      Load stage:    data_transfer  src -> fifo_in   (full R_0*...*R_n*C*S slice)
+      Compute stage: read_from_fifo fifo_in -> tensor<..xR_0x..xR_nxCxSxf16>
+                     linalg.generic (reduction over R_i and S) -> tensor<..xCxf16>
                      write_to_fifo fifo_out
       Store stage:   data_transfer  fifo_out -> dst
 
-    After:
+    After (only the across-stick loop R is exposed; S stays as a reduction):
 
       ktdf.private: fifo_in element count shrunk by R = product(R_i).
-                    (fifo_in: R*C -> C elements; other FIFOs unchanged.)
+                    (fifo_in: R*C*S -> C*S elements; other FIFOs unchanged.)
 
       Load stage:    scf.if %is_first \{} else \{ partial transfer }  (preserved outside loop)
                      scf.for %r0 = 0 to R_0 {
                        scf.for %r1 = 0 to R_1 { ...
-                         data_transfer src[..,%r0,.,%r1,..] -> fifo_in  (size C)
+                         data_transfer src[..,%r0,.,%r1,..] -> fifo_in  (size C*S)
                        }
                      }
       Compute stage: %seed = scf.if %is_first -> tensor<..xCxf16> {
@@ -130,8 +137,8 @@ def ReductionLoopExposurePass : Pass<"reduction-loop-exposure", "mlir::ModuleOp"
                      scf.for %r0 = 0 to R_0 iter_args(%a = %seed)
                          {loop_type = reduction_loop}
                        scf.for %r1 = 0 to R_1 iter_args(%a = %a) { ...
-                         %slice = read_from_fifo fifo_in -> tensor<..x1x..x1xCxf16>
-                         %a     = linalg.generic ins(%slice) outs(%a)
+                         %slice = read_from_fifo fifo_in -> tensor<..x1x..x1xCxSxf16>
+                         %a     = linalg.generic (reduction over S) ins(%slice) outs(%a)
                          if (all ivs == last): write_to_fifo %a, fifo_out
                          scf.yield %a
                        }
@@ -159,7 +166,7 @@ def ReductionLoopExposurePass : Pass<"reduction-loop-exposure", "mlir::ModuleOp"
 
     Preconditions (checked; pass skips cleanly if not met):
     - A ktdf.stage somewhere in the module contains a linalg.generic with
-      at least one statically-sized reduction iterator.
+      at least one statically-sized across-stick reduction iterator.
     - That stage is a direct child of a ktdf.pipeline with a ktdf.private.
     - The input FIFO (fifo_in) element count is divisible by R (where
       R = product(R_i)).
