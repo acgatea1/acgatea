@@ -606,16 +606,17 @@ struct ReductionLoopExposurePass
       return failure();
     }
 
-    // fifo_out: the fifo_slot operand of the write_to_fifo in compute_stage
-    // (already updated to new_priv after RAUW above).
+    // fifo_out: the fifo_slot operand of the write_to_fifo whose tensor input
+    // is directly produced by generic_op (i.e. generic_op.getResult(0) is the
+    // first operand of the write_to_fifo).  When the generic feeds another op
+    // first (e.g. a second-stage in-stick reduction after SplitReduction), this
+    // will be null and we take the non-FIFO path in rewriteComputeStage.
     Value fifo_out;
-    compute_stage.getBody()->walk([&](ktdf::WriteToFifoOp write_op) {
-      fifo_out = write_op.getFifoSlot();
-      return WalkResult::interrupt();
-    });
-    if (!fifo_out) {
-      inner_pipeline.emitError(PASS_NAME ": no write_to_fifo in compute stage");
-      return failure();
+    for (Operation* user : generic_op.getResult(0).getUsers()) {
+      if (auto write_op = dyn_cast<ktdf::WriteToFifoOp>(user)) {
+        fifo_out = write_op.getFifoSlot();
+        break;
+      }
     }
 
     // Output accumulator tensor type (from the generic's output).
@@ -973,12 +974,27 @@ struct ReductionLoopExposurePass
         body_builder.clone(*generic_op.getOperation(), mapping));
     Value updated_carry = new_generic.getResult(0);
 
-    // On the last iteration of all dimensions, write the accumulated result.
-    Value is_last = buildAllLast(body_builder, loc, nested.ivs, last_vals);
-    auto if_op = scf::IfOp::create(body_builder, loc, TypeRange{}, is_last,
-                                   /*withElseRegion=*/false);
-    OpBuilder then_builder(if_op.getThenRegion().front().getTerminator());
-    ktdf::WriteToFifoOp::create(then_builder, loc, updated_carry, fifo_out);
+    if (fifo_out) {
+      // The generic's result feeds a write_to_fifo directly.  Emit the
+      // guarded write on the last iteration and drop the original write op.
+      Value is_last = buildAllLast(body_builder, loc, nested.ivs, last_vals);
+      auto if_op = scf::IfOp::create(body_builder, loc, TypeRange{}, is_last,
+                                     /*withElseRegion=*/false);
+      OpBuilder then_builder(if_op.getThenRegion().front().getTerminator());
+      ktdf::WriteToFifoOp::create(then_builder, loc, updated_carry, fifo_out);
+    } else {
+      // The generic's result feeds other ops (e.g. a downstream in-stick
+      // reduction).  Replace all uses of the original generic with the
+      // outermost loop result so those ops pick up the fully-accumulated
+      // tensor after the loop completes.
+      generic_op.getResult(0).replaceAllUsesWith(
+          nested.outermost_loop.getResult(0));
+      // write_to_fifo has no results so use_empty() is always true; exclude
+      // it from the erase list so it is preserved together with the ops that
+      // feed it (G2 etc).
+      llvm::erase_if(
+          to_erase, [](Operation* op) { return isa<ktdf::WriteToFifoOp>(op); });
+    }
 
     // Replace the placeholder yield in the innermost loop with the real one.
     inner_yield->setOperand(0, updated_carry);
