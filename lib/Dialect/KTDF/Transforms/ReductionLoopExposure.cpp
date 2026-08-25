@@ -90,14 +90,6 @@ static llvm::cl::opt<bool> DisableThisPass(
 
 namespace {
 
-// Return true if `token` appears in the depends_in list of `stage`.
-// ---------------------------------------------------------------------------
-bool stageConsumesToken(ktdf::StageOp stage, Value token) {
-  for (Value dep : stage.getDependsIn())
-    if (dep == token) return true;
-  return false;
-}
-
 // ---------------------------------------------------------------------------
 // Carry the result of per-dimension reduction analysis.
 // ---------------------------------------------------------------------------
