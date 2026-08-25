@@ -464,7 +464,9 @@ static LogicalResult rewriteInStickGeneric(linalg::GenericOp generic_op) {
   OpBuilder builder(generic_op);
   Location loc = generic_op.getLoc();
 
-  // ins[0] is already a memref — the across-stick alloc from rewriteGeneric.
+  // ins[0] is a memref — either the across-stick alloc from rewriteGeneric, or
+  // a memref-typed read_from_fifo emitted by the caller when no across-stick
+  // loop exists.
   Value alloc_in = generic_op.getInputs()[0];
   auto in_memref_type = cast<MemRefType>(alloc_in.getType());
   unsigned in_rank = in_memref_type.getRank();
@@ -582,10 +584,24 @@ struct MapReductionPartialsPass
       }
     }
     for (auto generic_op : in_stick) {
+      // ins[0] is a tensor-typed ktdf.read_from_fifo when there was no
+      // across-stick loop feeding this generic (i.e. rewriteGeneric did not run
+      // on its pipeline).  Emit a memref-typed read in its place so that
+      // rewriteInStickGeneric can assume ins[0] is already a memref.
+      Operation* stale_tensor_read = nullptr;
+      if (generic_op.getInputs()[0].getDefiningOp<ktdf::ReadFromFifoOp>()) {
+        OpBuilder builder(generic_op);
+        stale_tensor_read = generic_op.getInputs()[0].getDefiningOp();
+        Value new_read = convertInputToMemref(builder, generic_op);
+        generic_op.getInputsMutable().assign(new_read);
+      }
+      // Transform in-stick generic into memref-typed generic.
       if (failed(rewriteInStickGeneric(generic_op))) {
         signalPassFailure();
         return;
       }
+      if (stale_tensor_read && stale_tensor_read->use_empty())
+        stale_tensor_read->erase();
     }
   }
 };
