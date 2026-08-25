@@ -77,8 +77,8 @@ def SplitReductionInnerOuterDimPass : Pass<"split-reduction-inner-outer-dim", "m
   let description = [{
     Walks the module for linalg.generic ops with at least one reduction
     iterator and splits each reduction dimension into an inner dimension of
-    size vector_length (derived from the hardware SIMD feature) and an outer
-    dimension of size reduction_dim / vector_length.
+    stick size (derived from the hardware SIMD feature) and an outer
+    dimension of size reduction_dim / stick size.
   }];
   let constructor = "::mlir::ktdf::createSplitReductionInnerOuterDimPass()";
   let dependentDialects = [

@@ -258,14 +258,14 @@ static void splitDim(CandidateInfo& info) {
   }
 
   // ── Build Generic 1 indexing maps ───────────────────────────────────────
-  // Generic 1 has the same N loop dims as the original.
-  // Output map: maps loop dim → intermediate tensor dim.
-  // A loop dim contributes an intermediate dim iff it is NOT an across-stick
-  // reduction (same ordering as inter_shape construction above).
+  // Generic 1 keeps all N loop dims of the original op.  Its output is the
+  // intermediate tensor, which has one dim per loop dim that survives G1
+  // (i.e. every dim that is NOT an across-stick reduction).
+  //
+  // Step 1: assign intermediate-tensor slots for every loop dim reachable
+  // through the input map, walking input dims left-to-right so the slot
+  // ordering matches inter_shape.
   unsigned inter_dim = 0;
-  // We need to know, for each loop dim, which intermediate dim it maps to.
-  // Walk the input dims in order (same order used for inter_shape) to assign
-  // intermediate dim indices.
   llvm::SmallDenseMap<unsigned, unsigned> loop_dim_to_inter_dim;
   for (int64_t d = 0; d < static_cast<int64_t>(input_shape.size()); ++d) {
     auto dim_expr = dyn_cast<AffineDimExpr>(input_map.getResult(d));
@@ -274,11 +274,29 @@ static void splitDim(CandidateInfo& info) {
     if (!across_stick_loop_dims.count(ld))
       loop_dim_to_inter_dim[ld] = inter_dim++;
   }
-  // Build g1 output map: for each result in the original output map (parallel
-  // dims), map to the corresponding intermediate dim.  In-stick dims are
-  // parallel in G1 so they also appear in the output.
-  // We need to emit one result per intermediate dim, in intermediate-dim order.
-  // Build the results array indexed by inter_dim position.
+  // Step 2: also assign slots for parallel loop dims whose only result is in
+  // the output map (they never appear as a result in the input map, so Step 1
+  // never visits them).  Concrete example from the failing IR:
+  //   iterator_types = [reduction, parallel, reduction, parallel]
+  //   input:  (d0,d1,d2,d3) -> (d0,d1,d2)   tensor<2x1x64>
+  //   output: (d0,d1,d2,d3) -> (d1,d3)       tensor<1x64>
+  // d0 is across-stick, d2 is in-stick, d1 appears in both maps, and d3
+  // appears only as output_map.getResult(1).  Step 1 walks input dims 0..2
+  // and produces {d1->0, d2->1}; d3 is never encountered.
+  // linalg.generic requires every parallel iterator to be anchored in at
+  // least one indexing map result, so G1's output map must include d3 or the
+  // verifier rejects the op with "non-invertible indexing maps".
+  ArrayRef<int64_t> output_shape = output_type.getShape();
+  for (unsigned r = 0; r < output_map.getNumResults(); ++r) {
+    auto dim_expr = dyn_cast<AffineDimExpr>(output_map.getResult(r));
+    if (!dim_expr) continue;
+    unsigned ld = dim_expr.getPosition();
+    if (!loop_dim_to_inter_dim.count(ld) && !across_stick_loop_dims.count(ld)) {
+      loop_dim_to_inter_dim[ld] = inter_dim++;
+      inter_shape.push_back(output_shape[r]);
+    }
+  }
+  // Build the g1 output map: one result per intermediate-tensor dim, in order.
   SmallVector<AffineExpr> g1_out_exprs(inter_dim);
   for (auto& [ld, id] : loop_dim_to_inter_dim)
     g1_out_exprs[id] = getAffineDimExpr(ld, ctx);
