@@ -465,29 +465,31 @@ static void widenFifoUses(Value fifo_slot, ArrayRef<int64_t> new_shape,
                           MemRefType new_alloc_type, MLIRContext* ctx) {
   auto new_sizes_attr = DenseI64ArrayAttr::get(ctx, new_shape);
 
-  // Constant all-zero affine map with no dynamic dimensions and one zero
-  // result per dimension of new_shape — used as the new alloc-side map.
-  SmallVector<AffineExpr> zero_exprs(new_shape.size(),
-                                     getAffineConstantExpr(0, ctx));
-  auto new_alloc_map =
-      AffineMapAttr::get(AffineMap::get(0, 0, zero_exprs, ctx));
+  // Build a zero-constant affine map for the alloc side of a transfer,
+  // preserving the number of dim inputs to match the existing dynamic indices.
+  auto makeZeroMap = [&](unsigned num_dims) -> AffineMapAttr {
+    SmallVector<AffineExpr> zero_exprs(new_shape.size(),
+                                       getAffineConstantExpr(0, ctx));
+    return AffineMapAttr::get(AffineMap::get(num_dims, 0, zero_exprs, ctx));
+  };
 
   for (Operation* user : fifo_slot.getUsers()) {
     auto xfer = dyn_cast<ktdf::DataTransferOp>(user);
     if (!xfer) continue;
 
     // Determine which end carries the alloc; update both size fields and
-    // rebuild the alloc-side map to match the widened rank.
+    // rebuild the alloc-side map to match the widened rank, preserving the
+    // number of dynamic index operands on that side.
     Value alloc_side;
     if (xfer.isSourceFifo()) {
       xfer.setStaticSourceSizesAttr(new_sizes_attr);
       xfer.setStaticDestSizesAttr(new_sizes_attr);
-      xfer.setDestMapAttr(new_alloc_map);
+      xfer.setDestMapAttr(makeZeroMap(xfer.getDestIndices().size()));
       alloc_side = xfer.getDestination();
     } else if (xfer.isDestFifo()) {
       xfer.setStaticDestSizesAttr(new_sizes_attr);
       xfer.setStaticSourceSizesAttr(new_sizes_attr);
-      xfer.setSourceMapAttr(new_alloc_map);
+      xfer.setSourceMapAttr(makeZeroMap(xfer.getSourceIndices().size()));
       alloc_side = xfer.getSource();
     } else {
       continue;
@@ -509,13 +511,15 @@ static void widenFifoUses(Value fifo_slot, ArrayRef<int64_t> new_shape,
       if (other_xfer.getSource() == alloc_side) {
         if (auto src_map = other_xfer.getSourceMapAttr())
           if (src_map.getValue().getNumResults() != new_shape.size())
-            other_xfer.setSourceMapAttr(new_alloc_map);
+            other_xfer.setSourceMapAttr(
+                makeZeroMap(other_xfer.getSourceIndices().size()));
         other_xfer.setStaticSourceSizesAttr(new_sizes_attr);
       }
       if (other_xfer.getDestination() == alloc_side) {
         if (auto dst_map = other_xfer.getDestMapAttr())
           if (dst_map.getValue().getNumResults() != new_shape.size())
-            other_xfer.setDestMapAttr(new_alloc_map);
+            other_xfer.setDestMapAttr(
+                makeZeroMap(other_xfer.getDestIndices().size()));
         other_xfer.setStaticDestSizesAttr(new_sizes_attr);
       }
     }
@@ -592,10 +596,16 @@ static LogicalResult rewriteInStickGeneric(linalg::GenericOp generic_op) {
   for (int64_t sz : sv_sizes) sv_sizes_ofr.push_back(builder.getIndexAttr(sz));
   SmallVector<OpFoldResult> sv_strides(in_rank, builder.getIndexAttr(1));
 
-  // Rank-reduced result shape: drop all size-1 (reduction) dims.
+  // Rank-reduced result shape: drop only reduction dims (those set to size 1
+  // above).  Parallel dims that happen to be size 1 must be kept so the result
+  // rank matches the output indexing map.
   SmallVector<int64_t> sv_result_shape;
-  for (int64_t sz : sv_sizes)
-    if (sz != 1) sv_result_shape.push_back(sz);
+  for (unsigned d = 0; d < in_rank; ++d) {
+    auto dim_expr = dyn_cast<AffineDimExpr>(in_map.getResult(d));
+    unsigned loop_dim = dim_expr ? dim_expr.getPosition() : in_rank;
+    if (iter_types[loop_dim] != utils::IteratorType::reduction)
+      sv_result_shape.push_back(in_shape[d]);
+  }
 
   // Let SubViewOp infer the correct strided layout from the source memref.
   auto sv_result_type =
