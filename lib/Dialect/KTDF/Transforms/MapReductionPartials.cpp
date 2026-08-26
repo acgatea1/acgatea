@@ -58,24 +58,26 @@
 //
 // ── In-stick generic (produced by SplitReductionInnerOuterDim) ───────────────
 //
-// After the across-stick rewrite above, %alloc_G1 (memref<CxDxf16, ms>) has
-// been RAUW'd in place of the loop result, so the in-stick generic sees:
+// After the across-stick rewrite above, %alloc_G1 (memref<D0x...xDNxf16, ms>)
+// has been RAUW'd in place of the loop result, so the in-stick generic sees:
 //
-//   %empty = tensor.empty() : tensor<Cxf16>
-//   %result = linalg.generic ins(%alloc_G1: memref<CxDxf16, ms>)
-//                            outs(%empty: tensor<Cxf16>)
+//   %empty = tensor.empty() : tensor<D0x...xDN-1xf16>
+//   %result = linalg.generic ins(%alloc_G1: memref<D0x...xDNxf16, ms>)
+//                            outs(%empty: tensor<D0x...xDN-1xf16>)
 //   ktdf.write_to_fifo %result, %fifo_out
 //
-// %alloc_G1 is reused as the output buffer.  A rank-reducing subview with
-// all-zero offsets, sizes = original size on parallel dims / 1 on reduction
-// dims, and all-one strides is created and used as both ins and outs of the
-// buffer linalg.generic.  The reduced result is written back into %alloc_G1
-// via the subview, and %alloc_G1 is then written to the FIFO.
+// A rank-reducing subview of %alloc_G1 (size=1 on reduction dims, original
+// size on parallel dims) is used as the outs buffer; ins is the full %alloc_G1.
+// After the reduction, the full %alloc_G1 — not the subview — is written to
+// the FIFO so the downstream stage receives all partial sums.
+// The FIFO slot type and the paired memref.alloc in the ktdf.private block are
+// widened to match %alloc_G1's shape.
 //
-//   %sv = memref.subview %alloc_G1[0,...][C,1,...][1,...]
-//             : memref<CxDxf16, ms> to memref<Cxf16, strided<[D]>, ms>
+//   %sv = memref.subview %alloc_G1[0,...][D0,...,1,...][1,...]
+//             : memref<D0x...xDNxf16, ms> to memref<D0x...xDN-1xf16, strided,
+//             ms>
 //   linalg.generic ins(%alloc_G1) outs(%sv)  {original maps & iter_types}
-//   ktdf.write_to_fifo %alloc_G1, %fifo_out
+//   ktdf.write_to_fifo %alloc_G1, %fifo_out  // full buffer
 //
 //===----------------------------------------------------------------------===//
 
@@ -429,33 +431,130 @@ static LogicalResult rewriteGeneric(
 }
 
 // ---------------------------------------------------------------------------
+// Set `new_type` on a PrivateOp result and its corresponding inner value
+// (the private_yield operand at the same index).
+//
+// Always called with a direct PrivateOp result; the inner value is derived
+// by indexing into private_yield.
+//
+// Example:
+//   %2#2 = ktdf.private -> (!ktdf.fifo.slot<"A"->"B", 4xf16>, ...)
+//     → widenPrivateResult(%2#2, !ktdf.fifo.slot<"A"->"B", 32xf16>)
+//   %2#3 = ktdf.private -> (memref<4xf16, ms>, ...)
+//     → widenPrivateResult(%2#3, memref<2x16xf16, ms>)
+// ---------------------------------------------------------------------------
+static void widenPrivateResult(Value priv_res, Type new_type) {
+  auto priv_op = cast<ktdf::PrivateOp>(cast<OpResult>(priv_res).getOwner());
+  unsigned idx = cast<OpResult>(priv_res).getResultNumber();
+  Value inner =
+      cast<ktdf::PrivateYieldOp>(priv_op.getRegion().front().getTerminator())
+          .getOperand(idx);
+  inner.setType(new_type);
+  priv_res.setType(new_type);
+}
+
+// ---------------------------------------------------------------------------
+// Iterate the direct uses of `fifo_slot` and for each data_transfer that
+// references it:
+//   - update both static size fields (fifo side and alloc side),
+//   - rebuild the alloc-side affine map to match the new rank,
+//   - widen the paired PrivateOp result and its inner alloc.
+// Early-exits per transfer if the alloc is already the target type.
+// ---------------------------------------------------------------------------
+static void widenFifoUses(Value fifo_slot, ArrayRef<int64_t> new_shape,
+                          MemRefType new_alloc_type, MLIRContext* ctx) {
+  auto new_sizes_attr = DenseI64ArrayAttr::get(ctx, new_shape);
+
+  // Constant all-zero affine map with no dynamic dimensions and one zero
+  // result per dimension of new_shape — used as the new alloc-side map.
+  SmallVector<AffineExpr> zero_exprs(new_shape.size(),
+                                     getAffineConstantExpr(0, ctx));
+  auto new_alloc_map =
+      AffineMapAttr::get(AffineMap::get(0, 0, zero_exprs, ctx));
+
+  for (Operation* user : fifo_slot.getUsers()) {
+    auto xfer = dyn_cast<ktdf::DataTransferOp>(user);
+    if (!xfer) continue;
+
+    // Determine which end carries the alloc; update both size fields and
+    // rebuild the alloc-side map to match the widened rank.
+    Value alloc_side;
+    if (xfer.isSourceFifo()) {
+      xfer.setStaticSourceSizesAttr(new_sizes_attr);
+      xfer.setStaticDestSizesAttr(new_sizes_attr);
+      xfer.setDestMapAttr(new_alloc_map);
+      alloc_side = xfer.getDestination();
+    } else if (xfer.isDestFifo()) {
+      xfer.setStaticDestSizesAttr(new_sizes_attr);
+      xfer.setStaticSourceSizesAttr(new_sizes_attr);
+      xfer.setSourceMapAttr(new_alloc_map);
+      alloc_side = xfer.getSource();
+    } else {
+      continue;
+    }
+
+    // alloc_side must be a PrivateOp result; skip anything else.
+    auto priv_result = dyn_cast<OpResult>(alloc_side);
+    if (!priv_result) continue;
+    if (!isa<ktdf::PrivateOp>(priv_result.getOwner())) continue;
+    if (alloc_side.getType() == new_alloc_type) continue;  // no widening needed
+    widenPrivateResult(alloc_side, new_alloc_type);
+
+    // Fix any other data_transfer that references alloc_side as source or
+    // destination but was not reached via the fifo_slot use-list (e.g. a
+    // memref→memref store-out transfer downstream of the widened alloc).
+    for (Operation* alloc_user : alloc_side.getUsers()) {
+      auto other_xfer = dyn_cast<ktdf::DataTransferOp>(alloc_user);
+      if (!other_xfer || other_xfer == xfer) continue;
+      if (other_xfer.getSource() == alloc_side) {
+        if (auto src_map = other_xfer.getSourceMapAttr())
+          if (src_map.getValue().getNumResults() != new_shape.size())
+            other_xfer.setSourceMapAttr(new_alloc_map);
+        other_xfer.setStaticSourceSizesAttr(new_sizes_attr);
+      }
+      if (other_xfer.getDestination() == alloc_side) {
+        if (auto dst_map = other_xfer.getDestMapAttr())
+          if (dst_map.getValue().getNumResults() != new_shape.size())
+            other_xfer.setDestMapAttr(new_alloc_map);
+        other_xfer.setStaticDestSizesAttr(new_sizes_attr);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Lower an in-stick reduction linalg.generic to buffer semantics.
 //
 // At this point (after rewriteGeneric has run on G1) the stage contains:
 //
-//   %result = linalg.generic ins(%alloc_G1: memref<CxDxf16, ms>)
-//                            outs(%empty:   tensor<Cxf16>)
+//   %result = linalg.generic ins(%alloc_G1: memref<D0x...xDNxf16, ms>)
+//                            outs(%empty:   tensor<D0x...xDN-1xf16>)
 //   ktdf.write_to_fifo %result, %fifo_out
 //
 // %alloc_G1 is already a memref (RAUW'd by rewriteGeneric).  We reuse it as
 // both input and output buffer:
 //
-//   ins  = %alloc_G1 (full memref<CxDxf16>) — rank matches the original ins
-//          map, no change needed.
+//   ins  = %alloc_G1 (full memref<D0x...xDNxf16>)
 //   outs = a rank-reducing subview of %alloc_G1 with size=1 on all reduction
 //          dims (rank-reduced away) and original size on parallel dims.  This
-//          gives memref<Cxf16, strided<[D]>> — a view into the first column
-//          of %alloc_G1 where the reduced results are written back in-place.
+//          gives a strided view into alloc_G1 where reduced results are
+//          written back in-place.
 //
-// The original indexing maps are preserved unchanged: the ins map operates
-// over the full rank-2 input, the outs map projects onto the rank-1 subview.
-// After the reduction, %alloc_G1 is written to the FIFO (the results live at
-// alloc_G1[i, 0] with stride D, matching what the subview exposed).
+// After the in-stick reduction, the full %alloc_G1 buffer — not the subview —
+// is sent to the FIFO so the downstream stage receives all partial sums.
+// The FIFO slot type and the paired memref.alloc in the ktdf.private block are
+// widened to match %alloc_G1's shape.
 //
-//   %sv = memref.subview %alloc_G1[0,...][C,1,...][1,...]
-//             : memref<CxDxf16, ms> to memref<Cxf16, strided<[D]>, ms>
-//   linalg.generic ins(%alloc_G1) outs(%sv)  {original maps & iter_types}
-//   ktdf.write_to_fifo %alloc_G1, %fifo_out
+// Example (memref<2x64xf16, ms>, reduction over dim 1):
+//
+//   %sv = memref.subview %alloc_G1[0, 0][2, 1][1, 1]
+//             : memref<2x64xf16, ms> to memref<2xf16, strided<[64]>, ms>
+//   linalg.generic ins(%alloc_G1) outs(%sv)
+//   ktdf.write_to_fifo %alloc_G1, %fifo_out    // full buffer, not subview
+//
+//   // ktdf.private widened (flat count 2 → 128, shape 2xf16 → 2x64xf16):
+//   %fifo = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"A" -> "B", 128xf16>
+//   %acc  = memref.alloc() : memref<2x64xf16, ct_local>
 // ---------------------------------------------------------------------------
 static LogicalResult rewriteInStickGeneric(linalg::GenericOp generic_op) {
   auto stage = generic_op->getParentOfType<ktdf::StageOp>();
@@ -508,9 +607,9 @@ static LogicalResult rewriteInStickGeneric(linalg::GenericOp generic_op) {
       memref::SubViewOp::create(builder, loc, sv_result_type, alloc_in,
                                 sv_offsets, sv_sizes_ofr, sv_strides);
 
-  // Buffer linalg.generic: ins = full alloc_in (rank-2), outs = rank-1
-  // subview.  Original maps and iterator_types are preserved — they already
-  // express the correct ins/outs rank relationship.
+  // Buffer linalg.generic: ins = full alloc_in, outs = rank-reduced subview.
+  // Original maps and iterator_types are preserved — they already express the
+  // correct ins/outs rank relationship.
   auto buf_generic = linalg::GenericOp::create(
       builder, loc,
       /*resultTensorTypes=*/TypeRange{},
@@ -524,12 +623,43 @@ static LogicalResult rewriteInStickGeneric(linalg::GenericOp generic_op) {
   Block& placeholder = buf_generic.getRegion().front();
   if (&placeholder != &buf_generic.getRegion().back()) placeholder.erase();
 
-  // Patch write_to_fifo to use the subview (2 elements, matching the FIFO).
+  // Patch write_to_fifo to send the full alloc_in buffer (not the subview),
+  // and capture the old fifo slot so we can widen its type below.
+  Value old_fifo_slot;
   Value generic_result = generic_op.getResult(0);
-  for (Operation* user : llvm::make_early_inc_range(generic_result.getUsers()))
-    if (auto write_op = dyn_cast<ktdf::WriteToFifoOp>(user))
-      write_op.getDataMutable().assign(subview.getResult());
+  for (Operation* user :
+       llvm::make_early_inc_range(generic_result.getUsers())) {
+    if (auto write_op = dyn_cast<ktdf::WriteToFifoOp>(user)) {
+      old_fifo_slot = write_op.getFifoSlot();
+      write_op.getDataMutable().assign(alloc_in);
+    }
+  }
   generic_result.replaceAllUsesWith(subview.getResult());
+
+  // Widen the FIFO slot type and all downstream allocs/transfers that use it.
+  // The new element count is the product of all input dimensions.
+  if (old_fifo_slot) {
+    auto old_slot_type = cast<ktdf::FifoSlotType>(old_fifo_slot.getType());
+    Type elem_type = old_slot_type.getElementType();
+
+    int64_t new_num_elems = 1;
+    for (int64_t sz : in_shape) new_num_elems *= sz;
+
+    auto new_slot_type = ktdf::FifoSlotType::get(
+        generic_op.getContext(), old_slot_type.getSrc(),
+        old_slot_type.getDest(), new_num_elems, elem_type);
+    auto new_alloc_type =
+        MemRefType::get(in_shape, elem_type, MemRefLayoutAttrInterface{},
+                        in_memref_type.getMemorySpace());
+
+    // Widen the PrivateOp result for the fifo slot (and its inner allocate).
+    widenPrivateResult(old_fifo_slot, new_slot_type);
+
+    // Update all data_transfer uses of the fifo slot and widen the paired
+    // memref.alloc in the ktdf.private block for each transfer.
+    widenFifoUses(old_fifo_slot, in_shape, new_alloc_type,
+                  generic_op.getContext());
+  }
 
   // Erase the original tensor.empty output initializer and the tensor generic.
   Value orig_out_init = generic_op.getDpsInitOperand(0)->get();

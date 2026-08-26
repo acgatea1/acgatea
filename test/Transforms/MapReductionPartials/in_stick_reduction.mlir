@@ -1,15 +1,5 @@
 // RUN: dataflow-scheduler-opt --map-reduction-partials %s | FileCheck %s
 
-// This script is intended to make adding checks to a test case quick and easy.
-// It is *not* authoritative about what constitutes a good test. After using the
-// script, be sure to review and refine the generated checks. For example,
-// For comprehensive guidelines, see:
-//   * https://mlir.llvm.org/getting_started/TestingGuide/
-
-
-
-
-
 // CHECK: #[[$ATTR_0:.+]] = affine_map<(d0, d1, d2) -> (d0, d1, d2)>
 // CHECK: #[[$ATTR_1:.+]] = affine_map<(d0, d1, d2) -> (d0, d2)>
 // CHECK: #[[$ATTR_2:.+]] = affine_map<(d0, d1) -> (d0, d1)>
@@ -41,16 +31,16 @@
 // CHECK-NEXT:       %[[CONSTANT_3:.*]] = arith.constant 1 : index
 // CHECK-NEXT:       %[[CONSTANT_4:.*]] = arith.constant 255 : index
 // CHECK-NEXT:       ktdf.pipeline {
-// CHECK-NEXT:         %[[PRIVATE_0:.*]]:8 = ktdf.private -> (memref<2x256x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 128xf16>, !ktdf.fifo.slot<"SFU" -> "L1SU", 2xf16>, memref<2xf16, "L1">, !ktdf.token, !ktdf.token, !ktdf.token, !ktdf.token) {
+// CHECK-NEXT:         %[[PRIVATE_0:.*]]:8 = ktdf.private -> (memref<2x256x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 128xf16>, !ktdf.fifo.slot<"SFU" -> "L1SU", 128xf16>, memref<2x64xf16, "SFU_REG">, !ktdf.token, !ktdf.token, !ktdf.token, !ktdf.token) {
 // CHECK-NEXT:           %[[ALLOC_0:.*]] = memref.alloc() : memref<2x256x64xf16, "L1">
 // CHECK-NEXT:           %[[FIFO_0:.*]] = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"L1LU" -> "SFU", 128xf16>
-// CHECK-NEXT:           %[[FIFO_1:.*]] = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"SFU" -> "L1SU", 2xf16>
-// CHECK-NEXT:           %[[ALLOC_1:.*]] = memref.alloc() : memref<2xf16, "L1">
+// CHECK-NEXT:           %[[FIFO_1:.*]] = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"SFU" -> "L1SU", 128xf16>
+// CHECK-NEXT:           %[[ALLOC_1:.*]] = memref.alloc() : memref<2x64xf16, "SFU_REG">
 // CHECK-NEXT:           %[[CREATE_TOKEN_0:.*]] = ktdf.create_token : !ktdf.token
 // CHECK-NEXT:           %[[CREATE_TOKEN_1:.*]] = ktdf.create_token : !ktdf.token
 // CHECK-NEXT:           %[[CREATE_TOKEN_2:.*]] = ktdf.create_token : !ktdf.token
 // CHECK-NEXT:           %[[CREATE_TOKEN_3:.*]] = ktdf.create_token : !ktdf.token
-// CHECK-NEXT:           ktdf.private_yield %[[ALLOC_0]], %[[FIFO_0]], %[[FIFO_1]], %[[ALLOC_1]], %[[CREATE_TOKEN_0]], %[[CREATE_TOKEN_1]], %[[CREATE_TOKEN_2]], %[[CREATE_TOKEN_3]] : memref<2x256x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 128xf16>, !ktdf.fifo.slot<"SFU" -> "L1SU", 2xf16>, memref<2xf16, "L1">, !ktdf.token, !ktdf.token, !ktdf.token, !ktdf.token
+// CHECK-NEXT:           ktdf.private_yield %[[ALLOC_0]], %[[FIFO_0]], %[[FIFO_1]], %[[ALLOC_1]], %[[CREATE_TOKEN_0]], %[[CREATE_TOKEN_1]], %[[CREATE_TOKEN_2]], %[[CREATE_TOKEN_3]] : memref<2x256x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 128xf16>, !ktdf.fifo.slot<"SFU" -> "L1SU", 128xf16>, memref<2x64xf16, "SFU_REG">, !ktdf.token, !ktdf.token, !ktdf.token, !ktdf.token
 // CHECK-NEXT:         }
 // CHECK-NEXT:         ktdf.stage depends_in(none) depends_out(%[[VAL_0:.*]]#4) {
 // CHECK-NEXT:           %[[CONSTANT_5:.*]] = arith.constant 256 : index
@@ -83,21 +73,21 @@
 // CHECK-NEXT:             %[[ADDF_1:.*]] = arith.addf %[[VAL_8]], %[[VAL_9]] : f16
 // CHECK-NEXT:             linalg.yield %[[ADDF_1]] : f16
 // CHECK-NEXT:           }
-// CHECK-NEXT:           ktdf.write_to_fifo %[[SUBVIEW_0]], %[[VAL_4]]#2 : memref<2xf16, strided<[64]>, "SFU_REG">, <"SFU" -> "L1SU", 2xf16>
+// CHECK-NEXT:           ktdf.write_to_fifo %[[ALLOC_2]], %[[VAL_4]]#2 : memref<2x64xf16, "SFU_REG">, <"SFU" -> "L1SU", 128xf16>
 // CHECK-NEXT:         } {applicable_units = ["SFU"]}
 // CHECK-NEXT:         ktdf.stage depends_in(%[[VAL_10:.*]]#6) depends_out(%[[VAL_10]]#7) {
 // CHECK-NEXT:           %[[CONSTANT_9:.*]] = arith.constant 256 : index
 // CHECK-NEXT:           scf.for %[[VAL_11:.*]] = %[[CONSTANT_2]] to %[[CONSTANT_9]] step %[[CONSTANT_3]] {
 // CHECK-NEXT:             %[[CMPI_0:.*]] = arith.cmpi eq, %[[VAL_11]], %[[CONSTANT_4]] : index
 // CHECK-NEXT:             scf.if %[[CMPI_0]] {
-// CHECK-NEXT:               ktdf.data_transfer from %[[VAL_10]]#2 size [2] to %[[VAL_10]]#3[0] size [2] : !ktdf.fifo.slot<"SFU" -> "L1SU", 2xf16>, memref<2xf16, "L1">
+// CHECK-NEXT:               ktdf.data_transfer from %[[VAL_10]]#2 size [2, 64] to %[[VAL_10]]#3[0, 0] size [2, 64] : !ktdf.fifo.slot<"SFU" -> "L1SU", 128xf16>, memref<2x64xf16, "SFU_REG">
 // CHECK-NEXT:             }
 // CHECK-NEXT:           } {loop_type = #ktdf.loop_type<reduction_loop>}
 // CHECK-NEXT:         } {applicable_units = ["L1SU"]}
 // CHECK-NEXT:         ktdf.stage depends_in(%[[VAL_12:.*]]#7) depends_out(none) {
 // CHECK-NEXT:           %[[CONSTANT_10:.*]] = arith.constant 256 : index
 // CHECK-NEXT:           scf.for %[[VAL_13:.*]] = %[[CONSTANT_2]] to %[[CONSTANT_10]] step %[[CONSTANT_3]] {
-// CHECK-NEXT:             ktdf.data_transfer from %[[VAL_12]]#3[0] size [2] to %[[CAST_1]]{{\[}}%[[CONSTANT_0]] * 2] size [2] : memref<2xf16, "L1">, memref<2xf16, strided<[1], offset: ?>, "DDR">
+// CHECK-NEXT:             ktdf.data_transfer from %[[VAL_12]]#3[0, 0] size [2, 64] to %[[CAST_1]]{{\[}}%[[CONSTANT_0]] * 2] size [2] : memref<2x64xf16, "SFU_REG">, memref<2xf16, strided<[1], offset: ?>, "DDR">
 // CHECK-NEXT:           } {loop_type = #ktdf.loop_type<reduction_loop>}
 // CHECK-NEXT:         } {applicable_units = ["MNISU"]}
 // CHECK-NEXT:       }
