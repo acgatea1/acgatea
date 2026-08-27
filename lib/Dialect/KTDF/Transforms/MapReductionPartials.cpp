@@ -445,10 +445,8 @@ static LogicalResult rewriteGeneric(
 // ---------------------------------------------------------------------------
 static void widenPrivateResult(Value priv_res, Type new_type) {
   auto priv_op = cast<ktdf::PrivateOp>(cast<OpResult>(priv_res).getOwner());
-  unsigned idx = cast<OpResult>(priv_res).getResultNumber();
-  Value inner =
-      cast<ktdf::PrivateYieldOp>(priv_op.getRegion().front().getTerminator())
-          .getOperand(idx);
+  auto result_idx = cast<OpResult>(priv_res).getResultNumber();
+  Value inner = priv_op.getYieldOp().getOperand(result_idx);
   inner.setType(new_type);
   priv_res.setType(new_type);
 }
