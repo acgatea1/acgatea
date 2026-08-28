@@ -100,71 +100,88 @@ struct ReductionInfo {
 };
 
 // ---------------------------------------------------------------------------
-// Return the loop dimension index that maps to the rightmost non-size-1 input
-// dimension of `generic_op`, if that loop dimension is a reduction.  This is
-// the in-stick dimension that must not be exposed as a loop by this pass.
+// Return the loop dimension index that corresponds to the inner dim:
+// the rightmost input dimension (input_rank - 1), if it is a reduction.
 // ---------------------------------------------------------------------------
-static std::optional<unsigned> findInStickLoopDim(
+static std::optional<unsigned> findInnerDimLoopDim(
     linalg::GenericOp generic_op) {
-  auto iter_types = generic_op.getIteratorTypesArray();
   auto input_type =
       dyn_cast<RankedTensorType>(generic_op.getInputs().front().getType());
   if (!input_type) return std::nullopt;
 
-  AffineMap input_map = generic_op.getIndexingMapsArray().front();
-  ArrayRef<int64_t> shape = input_type.getShape();
+  int64_t last = input_type.getRank() - 1;
 
-  for (int64_t d = static_cast<int64_t>(shape.size()) - 1; d >= 0; --d) {
-    if (shape[d] == 1) continue;
-    auto dim_expr = dyn_cast<AffineDimExpr>(input_map.getResult(d));
-    if (!dim_expr) return std::nullopt;
-    unsigned loop_dim = dim_expr.getPosition();
-    if (iter_types[loop_dim] == utils::IteratorType::reduction) return loop_dim;
-    return std::nullopt;  // rightmost non-1 dim is parallel — no in-stick
-  }
+  AffineMap input_map = generic_op.getIndexingMapsArray().front();
+  auto dim_expr = dyn_cast<AffineDimExpr>(input_map.getResult(last));
+  if (!dim_expr) return std::nullopt;
+
+  unsigned loop_dim = dim_expr.getPosition();
+  auto iter_types = generic_op.getIteratorTypesArray();
+  if (iter_types[loop_dim] == utils::IteratorType::reduction) return loop_dim;
   return std::nullopt;
 }
 
 // ---------------------------------------------------------------------------
 // Fill `info` with the reduction dimensions and sizes derived from
-// `generic_op`, excluding the in-stick (innermost) reduction dimension so
+// `generic_op`, excluding the inner reduction dimension so
 // that it is left for later handling by the ktdf.opaque wrapping pass.
 // Returns true on success.  Returns false (and emits a diagnostic or debug
 // message) when:
-//   - there are no across-stick reduction dimensions to expose, or
+//   - there are no outer-dim reduction dimensions to expose, or
 //   - any qualifying reduction dimension has a dynamic size.
 // ---------------------------------------------------------------------------
 static bool collectReductionInfo(linalg::GenericOp generic_op,
                                  ReductionInfo& info) {
-  std::optional<unsigned> in_stick_dim = findInStickLoopDim(generic_op);
+  std::optional<unsigned> inner_dim = findInnerDimLoopDim(generic_op);
+
+  auto input_type =
+      cast<RankedTensorType>(generic_op.getInputs().front().getType());
+  int64_t input_rank = input_type.getRank();
+
+  // Collect reduction dims to expose as loops, excluding only the inner
+  // dim (loop dim at input axis input_rank-1).  Output-only reduction dims
+  // (i >= input_rank) are included.  Size-1 dims are skipped.
+  auto output_type =
+      cast<RankedTensorType>(generic_op.getOutputs().front().getType());
+  AffineMap output_map = generic_op.getIndexingMapsArray().back();
 
   auto iter_types = generic_op.getIteratorTypesArray();
   for (int64_t i = 0; i < static_cast<int64_t>(iter_types.size()); ++i) {
     if (iter_types[i] != utils::IteratorType::reduction) continue;
-    if (in_stick_dim && static_cast<unsigned>(i) == *in_stick_dim) {
-      LDBG(1) << PASS_NAME ": skipping in-stick reduction dim " << i;
+    if (inner_dim && static_cast<unsigned>(i) == *inner_dim) {
+      LDBG(1) << PASS_NAME ": skipping inner-dim reduction dim " << i;
       continue;
     }
-    info.reduction_dims.push_back(i);
-  }
 
-  if (info.reduction_dims.empty()) {
-    LDBG(1) << PASS_NAME
-        ": no across-stick reduction dims to expose — skipping";
-    return false;
-  }
+    // Determine the size of this loop dim from the input tensor (if it
+    // appears there) or from the output tensor (output-only dim).
+    int64_t dim_sz = ShapedType::kDynamic;
+    if (i < input_rank) {
+      dim_sz = input_type.getDimSize(i);
+    } else {
+      for (unsigned r = 0; r < output_map.getNumResults(); ++r) {
+        auto expr = dyn_cast<AffineDimExpr>(output_map.getResult(r));
+        if (expr && expr.getPosition() == static_cast<unsigned>(i)) {
+          dim_sz = output_type.getDimSize(r);
+          break;
+        }
+      }
+    }
 
-  auto input_type =
-      cast<RankedTensorType>(generic_op.getInputs().front().getType());
-
-  for (int64_t reduction_dim : info.reduction_dims) {
-    int64_t dim_sz = input_type.getDimSize(reduction_dim);
     if (dim_sz == ShapedType::kDynamic) {
       LDBG(1) << PASS_NAME ": dynamic reduction size not supported — skipping";
       return false;
     }
+    if (dim_sz == 1) continue;
+
+    info.reduction_dims.push_back(i);
     info.dim_sizes.push_back(dim_sz);
     info.reduction_size *= dim_sz;
+  }
+
+  if (info.reduction_dims.empty()) {
+    LDBG(1) << PASS_NAME ": no outer-dim reduction dims to expose — skipping";
+    return false;
   }
 
   LDBG(1) << PASS_NAME ": reduction_dims=[";
@@ -178,10 +195,12 @@ static bool collectReductionInfo(linalg::GenericOp generic_op,
 }
 
 // ---------------------------------------------------------------------------
-// Collect all linalg.generic ops directly inside `stage` that have across-stick
+// Collect all linalg.generic ops directly inside `stage` that have outer-dim
 // reduction dims to expose (i.e. collectReductionInfo succeeds for them).
-// In-stick-only generics are excluded — they are left for a later
-// opaque-generating pass.
+//
+// Generics whose first input is produced by another linalg.generic are
+// chained inner-dim ops (e.g. G2 after SplitReductionInnerOuterDim) and are
+// skipped (their reduction loops should not be exposed).
 // ---------------------------------------------------------------------------
 static void collectReductionGenericOps(
     ktdf::StageOp stage, SmallVectorImpl<linalg::GenericOp>& result) {
@@ -190,6 +209,10 @@ static void collectReductionGenericOps(
   stage.getBody()->walk<WalkOrder::PreOrder>([&](Operation* op) {
     if (isa<ktdf::StageOp>(op)) return WalkResult::skip();
     if (auto generic = dyn_cast<linalg::GenericOp>(op)) {
+      // Skip chained generics whose input comes from another generic — those
+      // are inner-dim ops left for a later pass.
+      if (generic.getInputs().front().getDefiningOp<linalg::GenericOp>())
+        return WalkResult::advance();
       ReductionInfo info;
       if (collectReductionInfo(generic, info)) result.push_back(generic);
     }
@@ -429,7 +452,7 @@ struct ReductionLoopExposurePass
 
  private:
   // -------------------------------------------------------------------------
-  // Collect every (stage, generic) pair where the generic has across-stick
+  // Collect every (stage, generic) pair where the generic has outer-dim
   // reduction dims to expose, then rewrite each.
   //
   // Post-order walk ensures inner stages are processed before outer ones.
@@ -460,7 +483,7 @@ struct ReductionLoopExposurePass
 
   // -------------------------------------------------------------------------
   // Rewrite the ktdf.pipeline that contains `compute_stage` for the given
-  // `generic_op` (which has across-stick reduction dims to expose).
+  // `generic_op` (which has outer-dim reduction dims to expose).
   // -------------------------------------------------------------------------
   LogicalResult rewritePipeline(ktdf::StageOp compute_stage,
                                 linalg::GenericOp generic_op) {
@@ -601,8 +624,8 @@ struct ReductionLoopExposurePass
     // fifo_out: the fifo_slot operand of the write_to_fifo whose tensor input
     // is directly produced by generic_op (i.e. generic_op.getResult(0) is the
     // first operand of the write_to_fifo).  When the generic feeds another op
-    // first (e.g. a second-stage in-stick reduction after SplitReduction), this
-    // will be null and we take the non-FIFO path in rewriteComputeStage.
+    // first (e.g. a second-stage inner-dim reduction after SplitReduction),
+    // this will be null and we take the non-FIFO path in rewriteComputeStage.
     Value fifo_out;
     for (Operation* user : generic_op.getResult(0).getUsers()) {
       if (auto write_op = dyn_cast<ktdf::WriteToFifoOp>(user)) {
@@ -975,7 +998,7 @@ struct ReductionLoopExposurePass
       OpBuilder then_builder(if_op.getThenRegion().front().getTerminator());
       ktdf::WriteToFifoOp::create(then_builder, loc, updated_carry, fifo_out);
     } else {
-      // The generic's result feeds other ops (e.g. a downstream in-stick
+      // The generic's result feeds other ops (e.g. a downstream inner-dim
       // reduction).  Replace all uses of the original generic with the
       // outermost loop result so those ops pick up the fully-accumulated
       // tensor after the loop completes.
