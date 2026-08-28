@@ -460,7 +460,7 @@ static void widenPrivateResult(Value priv_res, Type new_type) {
 // Early-exits per transfer if the alloc is already the target type.
 // ---------------------------------------------------------------------------
 static void widenFifoUses(Value fifo_slot, ArrayRef<int64_t> new_shape,
-                          MemRefType new_alloc_type, MLIRContext* ctx) {
+                          Type new_elem_type, MLIRContext* ctx) {
   auto new_sizes_attr = DenseI64ArrayAttr::get(ctx, new_shape);
 
   // Build a zero-constant affine map for the alloc side of a transfer,
@@ -497,6 +497,11 @@ static void widenFifoUses(Value fifo_slot, ArrayRef<int64_t> new_shape,
     auto priv_result = dyn_cast<OpResult>(alloc_side);
     if (!priv_result) continue;
     if (!isa<ktdf::PrivateOp>(priv_result.getOwner())) continue;
+    // Preserve the existing memory space — only the shape changes.
+    auto existing_memref = cast<MemRefType>(alloc_side.getType());
+    auto new_alloc_type =
+        MemRefType::get(new_shape, new_elem_type, MemRefLayoutAttrInterface{},
+                        existing_memref.getMemorySpace());
     if (alloc_side.getType() == new_alloc_type) continue;  // no widening needed
     widenPrivateResult(alloc_side, new_alloc_type);
 
@@ -508,17 +513,19 @@ static void widenFifoUses(Value fifo_slot, ArrayRef<int64_t> new_shape,
       if (!other_xfer || other_xfer == xfer) continue;
       if (other_xfer.getSource() == alloc_side) {
         if (auto src_map = other_xfer.getSourceMapAttr())
-          if (src_map.getValue().getNumResults() != new_shape.size())
+          if (src_map.getValue().getNumResults() != new_shape.size()) {
             other_xfer.setSourceMapAttr(
                 makeZeroMap(other_xfer.getSourceIndices().size()));
-        other_xfer.setStaticSourceSizesAttr(new_sizes_attr);
+            other_xfer.setStaticSourceSizesAttr(new_sizes_attr);
+          }
       }
       if (other_xfer.getDestination() == alloc_side) {
         if (auto dst_map = other_xfer.getDestMapAttr())
-          if (dst_map.getValue().getNumResults() != new_shape.size())
+          if (dst_map.getValue().getNumResults() != new_shape.size()) {
             other_xfer.setDestMapAttr(
                 makeZeroMap(other_xfer.getDestIndices().size()));
-        other_xfer.setStaticDestSizesAttr(new_sizes_attr);
+            other_xfer.setStaticDestSizesAttr(new_sizes_attr);
+          }
       }
     }
   }
@@ -669,17 +676,13 @@ static LogicalResult rewriteInnerDimGeneric(linalg::GenericOp generic_op) {
     auto new_slot_type = ktdf::FifoSlotType::get(
         generic_op.getContext(), old_slot_type.getSrc(),
         old_slot_type.getDest(), new_num_elems, elem_type);
-    auto new_alloc_type =
-        MemRefType::get(in_shape, elem_type, MemRefLayoutAttrInterface{},
-                        in_memref_type.getMemorySpace());
-
     // Widen the PrivateOp result for the fifo slot (and its inner allocate).
     widenPrivateResult(old_fifo_slot, new_slot_type);
 
     // Update all data_transfer uses of the fifo slot and widen the paired
     // memref.alloc in the ktdf.private block for each transfer.
-    widenFifoUses(old_fifo_slot, in_shape, new_alloc_type,
-                  generic_op.getContext());
+    // The memory space of each alloc is preserved inside widenFifoUses.
+    widenFifoUses(old_fifo_slot, in_shape, elem_type, generic_op.getContext());
   }
 
   // Erase the original tensor.empty output initializer and the tensor generic.
