@@ -100,28 +100,6 @@ struct ReductionInfo {
 };
 
 // ---------------------------------------------------------------------------
-// Return the loop dimension index that corresponds to the inner dim:
-// the rightmost input dimension (input_rank - 1), if it is a reduction.
-// ---------------------------------------------------------------------------
-static std::optional<unsigned> findInnerDimLoopDim(
-    linalg::GenericOp generic_op) {
-  auto input_type =
-      dyn_cast<RankedTensorType>(generic_op.getInputs().front().getType());
-  if (!input_type) return std::nullopt;
-
-  int64_t last = input_type.getRank() - 1;
-
-  AffineMap input_map = generic_op.getIndexingMapsArray().front();
-  auto dim_expr = dyn_cast<AffineDimExpr>(input_map.getResult(last));
-  if (!dim_expr) return std::nullopt;
-
-  unsigned loop_dim = dim_expr.getPosition();
-  auto iter_types = generic_op.getIteratorTypesArray();
-  if (iter_types[loop_dim] == utils::IteratorType::reduction) return loop_dim;
-  return std::nullopt;
-}
-
-// ---------------------------------------------------------------------------
 // Fill `info` with the reduction dimensions and sizes derived from
 // `generic_op`, excluding the inner reduction dimension so
 // that it is left for later handling by the ktdf.opaque wrapping pass.
@@ -132,7 +110,7 @@ static std::optional<unsigned> findInnerDimLoopDim(
 // ---------------------------------------------------------------------------
 static bool collectReductionInfo(linalg::GenericOp generic_op,
                                  ReductionInfo& info) {
-  std::optional<unsigned> inner_dim = findInnerDimLoopDim(generic_op);
+  std::optional<unsigned> inner_dim = ktdf::findInnerDimLoopDim(generic_op);
 
   auto input_type =
       cast<RankedTensorType>(generic_op.getInputs().front().getType());

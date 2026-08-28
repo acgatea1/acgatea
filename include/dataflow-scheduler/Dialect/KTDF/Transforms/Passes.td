@@ -93,22 +93,20 @@ def ReductionLoopExposurePass : Pass<"reduction-loop-exposure", "mlir::ModuleOp"
   let description = [{
     Walks the module for any ktdf.stage that contains a linalg.generic with a
     reduction iterator (the Compute stage).  For each one found it rewrites the
-    parent ktdf.pipeline so that the across-stick reduction becomes one nested
-    scf.for loop per reduction dimension, with the accumulator tensor threaded
-    as iter_args.
+    parent ktdf.pipeline so that the outer reduction becomes one nested scf.for loop per reduction dimension, with the accumulator tensor
+    threaded as iter_args.
 
-    The in-stick (innermost) reduction dimension — identified as the reduction
-    loop dim that maps to the rightmost non-size-1 input tensor dimension — is
-    excluded from loop exposure and left as-is for later handling by the
-    ktdf.opaque wrapping pass.
+    The innermost reduction dimension — identified as the reduction loop dim
+    that maps to the rightmost input tensor dimension — is excluded from loop
+    exposure and left as-is for later handling by ReductionOpacification.
 
     The pass may be composed with ReductionDimChunking.  When the input has
     already been chunked, the Load stage body contains a scf.if that feeds
     the previous chunk's partial result into fifo_partial on non-first
     iterations; the pass preserves that scf.if outside the new reduction loop.
 
-    Before (R_i = size of across-stick reduction dimension i; S = in-stick
-    reduction size; C = non-reduction elements):
+    Before (R_i = size of outer reduction dimension i; S = innermost reduction
+    size; C = non-reduction elements):
 
       ktdf.private: [fifo_in(R_0*...*R_n*C*S elements), fifo_out(C*S elements), ...]
 
@@ -118,7 +116,7 @@ def ReductionLoopExposurePass : Pass<"reduction-loop-exposure", "mlir::ModuleOp"
                      write_to_fifo fifo_out
       Store stage:   data_transfer  fifo_out -> dst
 
-    After (only the across-stick loop R is exposed; S stays as a reduction):
+    After (only the outer reduction loop R is exposed; S stays as a reduction):
 
       ktdf.private: fifo_in element count shrunk by R = product(R_i).
                     (fifo_in: R*C*S -> C*S elements; other FIFOs unchanged.)
@@ -166,7 +164,7 @@ def ReductionLoopExposurePass : Pass<"reduction-loop-exposure", "mlir::ModuleOp"
 
     Preconditions (checked; pass skips cleanly if not met):
     - A ktdf.stage somewhere in the module contains a linalg.generic with
-      at least one statically-sized across-stick reduction iterator.
+      at least one statically-sized outer reduction iterator.
     - That stage is a direct child of a ktdf.pipeline with a ktdf.private.
     - The input FIFO (fifo_in) element count is divisible by R (where
       R = product(R_i)).
@@ -183,6 +181,23 @@ def ReductionLoopExposurePass : Pass<"reduction-loop-exposure", "mlir::ModuleOp"
 }
 
 
+
+def ReductionOpacificationPass : Pass<"reduction-opacification", "mlir::ModuleOp"> {
+  let summary = "Wrap innermost-dimension reduction linalg.generic ops in ktdf.opaque";
+  let description = [{
+    Walks the module for linalg.generic ops that carry an innermost reduction
+    — i.e. the reduction iterator whose loop dimension maps to the rightmost
+    input-tensor dimension.
+
+    For each such generic found inside a ktdf.stage the pass will replace it
+    with a ktdf.opaque.
+  }];
+  let constructor = "::mlir::ktdf::createReductionOpacificationPass()";
+  let dependentDialects = [
+    "mlir::ktdf::KTDFDialect",
+    "mlir::linalg::LinalgDialect"
+  ];
+}
 
 def SubsumeLinearizeIndexPass : Pass<"subsume-linearize-index", "mlir::ModuleOp"> {
   let summary = "Fold ktdf.tiling.linearize_index into ktdf.data_transfer affine maps";
