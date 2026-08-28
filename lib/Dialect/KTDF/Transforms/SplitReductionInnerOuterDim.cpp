@@ -66,10 +66,10 @@ struct ReductionDimInfo {
 // ---------------------------------------------------------------------------
 struct CandidateInfo {
   linalg::GenericOp generic_op;
-  // In-stick: exactly one dim — the rightmost reduction dim in input order.
-  SmallVector<ReductionDimInfo> in_stick;
-  // Across-stick: all remaining (leftward) reduction dims, same ordering.
-  SmallVector<ReductionDimInfo> across_stick;
+  // Inner dim: exactly one — the rightmost reduction dim in input order.
+  SmallVector<ReductionDimInfo> inner_dim;
+  // Outer dims: all remaining (leftward) reduction dims, same ordering.
+  SmallVector<ReductionDimInfo> outer_dims;
 };
 
 // ---------------------------------------------------------------------------
@@ -86,7 +86,6 @@ static LogicalResult collectReductionDims(
   AffineMap input_map = generic_op.getIndexingMapsArray().front();
   ArrayRef<int64_t> shape = input_type.getShape();
 
-  // Build a map: loop_dim -> input tensor dim index (only for reduction dims).
   // Iterate input dims left-to-right so the result list is in input order.
   for (int64_t d = 0; d < static_cast<int64_t>(shape.size()); ++d) {
     auto dim_expr = dyn_cast<AffineDimExpr>(input_map.getResult(d));
@@ -106,10 +105,9 @@ static LogicalResult collectReductionDims(
 
 // ---------------------------------------------------------------------------
 // Return true when `generic_op` qualifies for the split:
-//   1. It has at least two reduction iterator types (one in-stick + at least
-//      one across-stick).
-//   2. The rightmost non-1 input dimension maps to a reduction loop dim
-//      (i.e. the innermost dim is the in-stick dimension).
+//   1. It has at least two reduction iterator types (one inner + at least
+//      one outer).
+//   2. The rightmost input dimension maps to a reduction loop dim.
 // ---------------------------------------------------------------------------
 static bool isEligible(linalg::GenericOp generic_op) {
   auto iter_types = generic_op.getIteratorTypesArray();
@@ -120,37 +118,24 @@ static bool isEligible(linalg::GenericOp generic_op) {
     if (it == utils::IteratorType::reduction) ++num_reductions;
   if (num_reductions < 2) return false;
 
-  // Condition 2: find the rightmost input dimension that is not size 1, and
-  // check that its corresponding loop dim (via the input's indexing map) is a
-  // reduction.
+  // Condition 2: check that the rightmost input dimension maps to a reduction
+  // loop dim (via the input's indexing map).
   auto input_type =
       dyn_cast<RankedTensorType>(generic_op.getInputs().front().getType());
   if (!input_type) return false;
 
   AffineMap input_map = generic_op.getIndexingMapsArray().front();
-  ArrayRef<int64_t> shape = input_type.getShape();
+  unsigned last = input_map.getNumResults() - 1;
+  auto dim_expr = dyn_cast<AffineDimExpr>(input_map.getResult(last));
+  if (!dim_expr) return false;
 
-  // Walk input dims from rightmost to leftmost.
-  for (int64_t d = static_cast<int64_t>(shape.size()) - 1; d >= 0; --d) {
-    if (shape[d] == 1) continue;  // skip size-1 dims
-
-    // Find the loop dim that this input dim maps to.
-    // input_map.getResult(d) must be a pure dim expression (AffineDimExpr).
-    AffineExpr expr = input_map.getResult(d);
-    auto dim_expr = dyn_cast<AffineDimExpr>(expr);
-    if (!dim_expr) return false;
-
-    unsigned loop_dim = dim_expr.getPosition();
-    return iter_types[loop_dim] == utils::IteratorType::reduction;
-  }
-
-  return false;
+  return iter_types[dim_expr.getPosition()] == utils::IteratorType::reduction;
 }
 
 // ---------------------------------------------------------------------------
 // Partition the reduction dims of `generic_op` into:
-//   in-stick   — exactly the rightmost reduction dim (in input order).
-//   across-stick — all remaining (leftward) reduction dims.
+//   inner dim  — exactly the rightmost reduction dim (in input order).
+//   outer dims — all remaining (leftward) reduction dims.
 // ---------------------------------------------------------------------------
 static FailureOr<CandidateInfo> partitionReductionDims(
     linalg::GenericOp generic_op, int64_t vector_length) {
@@ -160,25 +145,24 @@ static FailureOr<CandidateInfo> partitionReductionDims(
   SmallVector<ReductionDimInfo> all_dims;
   if (failed(collectReductionDims(generic_op, all_dims))) return failure();
 
-  // The rightmost reduction dim (last in all_dims, ordered by input position)
-  // is the single in-stick dim.
+  // The rightmost reduction dim (last in all_dims) is the inner dim.
   assert(!all_dims.empty());
-  ReductionDimInfo& in_stick_dim = all_dims.back();
-  assert(in_stick_dim.size == vector_length &&
-         "in-stick (innermost) reduction dim size must equal stick size");
+  ReductionDimInfo& inner_dim = all_dims.back();
+  assert(inner_dim.size == vector_length &&
+         "inner (rightmost) reduction dim size must equal vector length");
 
-  // all_dims[0 .. N-2] are across-stick; all_dims[N-1] is in-stick.
+  // all_dims[0 .. N-2] are outer dims; all_dims[N-1] is the inner dim.
   for (int i = 0; i < static_cast<int>(all_dims.size()) - 1; ++i)
-    info.across_stick.push_back(all_dims[i]);
-  info.in_stick.push_back(in_stick_dim);
+    info.outer_dims.push_back(all_dims[i]);
+  info.inner_dim.push_back(inner_dim);
 
   LDBG(1) << PASS_NAME ": generic at " << generic_op.getLoc()
           << " vector_length=" << vector_length
-          << " in-stick dims (loop_dim:size):";
-  for (auto& d : info.in_stick)
+          << " inner dim (loop_dim:size):";
+  for (auto& d : info.inner_dim)
     LDBG(1) << "  [" << d.loop_dim << "]=" << d.size;
-  LDBG(1) << " across-stick dims (loop_dim:size):";
-  for (auto& d : info.across_stick)
+  LDBG(1) << " outer dims (loop_dim:size):";
+  for (auto& d : info.outer_dims)
     LDBG(1) << "  [" << d.loop_dim << "]=" << d.size;
 
   return info;
@@ -200,20 +184,19 @@ static void cloneGenericBody(linalg::GenericOp src, linalg::GenericOp dst) {
 // ---------------------------------------------------------------------------
 // Split a reduction linalg.generic into two:
 //
-//   Generic 1 (across-stick reduction): reduces the across-stick dims.
+//   Generic 1 (outer reduction): reduces the outer dims.
 //     Input:  original input tensor
-//     Output: intermediate tensor whose dims = original parallel dims +
-//             in-stick dims (across-stick dims are reduced away).
-//     Iterator types: across-stick dims → reduction, in-stick dims → parallel,
-//                     original parallel dims unchanged.
+//     Output: intermediate tensor — input dims with outer reduction dims
+//             removed; the inner dim is kept as parallel.
+//     Iterator types: outer dims → reduction, inner dim → parallel,
+//                     other input-map dims unchanged.
 //
-//   Generic 2 (in-stick reduction): reduces the in-stick dims.
+//   Generic 2 (inner reduction): reduces the inner dim.
 //     Input:  intermediate tensor (result of Generic 1)
 //     Output: same type as the original output
-//     Iterator types: in-stick dims → reduction, parallel dims → parallel.
+//     Iterator types: inner dim → reduction, all other dims → parallel.
 //
-// The original generic is replaced: all uses of its result are replaced by
-// the result of Generic 2, then it is erased.
+// The original generic is replaced by the result of Generic 2 and erased.
 // ---------------------------------------------------------------------------
 static void splitDim(CandidateInfo& info) {
   linalg::GenericOp generic_op = info.generic_op;
@@ -238,121 +221,100 @@ static void splitDim(CandidateInfo& info) {
   ArrayRef<int64_t> input_shape = input_type.getShape();
   Type elem_type = output_type.getElementType();
 
-  // Build sets of in-stick and across-stick loop dim indices for quick lookup.
-  llvm::SmallDenseSet<unsigned> in_stick_loop_dims;
-  llvm::SmallDenseSet<unsigned> across_stick_loop_dims;
-  for (auto& d : info.in_stick) in_stick_loop_dims.insert(d.loop_dim);
-  for (auto& d : info.across_stick) across_stick_loop_dims.insert(d.loop_dim);
+  // Build sets of outer and inner loop dim indices for quick lookup.
+  llvm::SmallDenseSet<unsigned> inner_loop_dims;
+  llvm::SmallDenseSet<unsigned> outer_loop_dims;
+  for (auto& d : info.inner_dim) inner_loop_dims.insert(d.loop_dim);
+  for (auto& d : info.outer_dims) outer_loop_dims.insert(d.loop_dim);
 
-  // ── Build intermediate tensor shape ─────────────────────────────────────
-  // The intermediate tensor has one dim per input tensor dim whose
-  // corresponding loop dim is NOT an across-stick reduction (i.e. parallel or
-  // in-stick).  We walk the input map results left-to-right to preserve order.
+  // ── Build G1 ─────────────────────────────────────────────────────────────
+  // G1 loops over exactly the dims that appear in the input map, in order
+  // (g1_num_dims = input map rank).  Any dims that appear only in the output
+  // map are not part of G1's loop space — they belong entirely to G2.
+  // orig_to_g1_dim: original loop dim index → G1 loop dim index.
+  unsigned g1_num_dims = input_map.getNumResults();
+  llvm::SmallDenseMap<unsigned, unsigned> orig_to_g1_dim;
+  for (unsigned r = 0; r < g1_num_dims; ++r) {
+    unsigned orig_ld =
+        cast<AffineDimExpr>(input_map.getResult(r)).getPosition();
+    orig_to_g1_dim[orig_ld] = r;
+  }
+
+  // G1 input map: identity over G1's loop dims.
+  SmallVector<AffineExpr> g1_in_exprs;
+  for (unsigned r = 0; r < g1_num_dims; ++r)
+    g1_in_exprs.push_back(getAffineDimExpr(r, ctx));
+  AffineMap g1_in_map = AffineMap::get(g1_num_dims, 0, g1_in_exprs, ctx);
+
+  // G1 output map and intermediate shape: walk the input map left-to-right,
+  // skipping outer reduction dims (which G1 reduces away).  Each surviving
+  // dim contributes one result to G1's output map and one dim to the
+  // intermediate tensor.
   SmallVector<int64_t> inter_shape;
-  for (int64_t d = 0; d < static_cast<int64_t>(input_shape.size()); ++d) {
-    auto dim_expr = dyn_cast<AffineDimExpr>(input_map.getResult(d));
-    if (!dim_expr) continue;  // non-trivial expression — skip
-    unsigned ld = dim_expr.getPosition();
-    if (!across_stick_loop_dims.count(ld))
-      inter_shape.push_back(input_shape[d]);
+  SmallVector<AffineExpr> g1_out_exprs;
+  llvm::SmallDenseMap<unsigned, unsigned> orig_ld_to_inter_slot;
+  for (unsigned r = 0; r < g1_num_dims; ++r) {
+    unsigned orig_ld =
+        cast<AffineDimExpr>(input_map.getResult(r)).getPosition();
+    if (outer_loop_dims.count(orig_ld)) continue;
+    orig_ld_to_inter_slot[orig_ld] = static_cast<unsigned>(inter_shape.size());
+    inter_shape.push_back(input_shape[r]);
+    g1_out_exprs.push_back(getAffineDimExpr(orig_to_g1_dim[orig_ld], ctx));
+  }
+  AffineMap g1_out_map = AffineMap::get(g1_num_dims, 0, g1_out_exprs, ctx);
+
+  // G1 iterator types: outer dims → reduction, inner dim → parallel,
+  // other input-map dims → same as original.
+  SmallVector<utils::IteratorType> g1_iter_types(g1_num_dims);
+  for (unsigned r = 0; r < g1_num_dims; ++r) {
+    unsigned orig_ld =
+        cast<AffineDimExpr>(input_map.getResult(r)).getPosition();
+    if (outer_loop_dims.count(orig_ld))
+      g1_iter_types[r] = utils::IteratorType::reduction;
+    else if (inner_loop_dims.count(orig_ld))
+      g1_iter_types[r] = utils::IteratorType::parallel;
+    else
+      g1_iter_types[r] = orig_iter_types[orig_ld];
   }
 
-  // ── Build Generic 1 indexing maps ───────────────────────────────────────
-  // Generic 1 keeps all N loop dims of the original op.  Its output is the
-  // intermediate tensor, which has one dim per loop dim that survives G1
-  // (i.e. every dim that is NOT an across-stick reduction).
-  //
-  // Step 1: assign intermediate-tensor slots for every loop dim reachable
-  // through the input map, walking input dims left-to-right so the slot
-  // ordering matches inter_shape.
-  unsigned inter_dim = 0;
-  llvm::SmallDenseMap<unsigned, unsigned> loop_dim_to_inter_dim;
-  for (int64_t d = 0; d < static_cast<int64_t>(input_shape.size()); ++d) {
-    auto dim_expr = dyn_cast<AffineDimExpr>(input_map.getResult(d));
-    if (!dim_expr) continue;
-    unsigned ld = dim_expr.getPosition();
-    if (!across_stick_loop_dims.count(ld))
-      loop_dim_to_inter_dim[ld] = inter_dim++;
-  }
-  // Step 2: also assign slots for parallel loop dims whose only result is in
-  // the output map (they never appear as a result in the input map, so Step 1
-  // never visits them).  Concrete example from the failing IR:
-  //   iterator_types = [reduction, parallel, reduction, parallel]
-  //   input:  (d0,d1,d2,d3) -> (d0,d1,d2)   tensor<2x1x64>
-  //   output: (d0,d1,d2,d3) -> (d1,d3)       tensor<1x64>
-  // d0 is across-stick, d2 is in-stick, d1 appears in both maps, and d3
-  // appears only as output_map.getResult(1).  Step 1 walks input dims 0..2
-  // and produces {d1->0, d2->1}; d3 is never encountered.
-  // linalg.generic requires every parallel iterator to be anchored in at
-  // least one indexing map result, so G1's output map must include d3 or the
-  // verifier rejects the op with "non-invertible indexing maps".
-  ArrayRef<int64_t> output_shape = output_type.getShape();
-  for (unsigned r = 0; r < output_map.getNumResults(); ++r) {
-    auto dim_expr = dyn_cast<AffineDimExpr>(output_map.getResult(r));
-    if (!dim_expr) continue;
-    unsigned ld = dim_expr.getPosition();
-    if (!loop_dim_to_inter_dim.count(ld) && !across_stick_loop_dims.count(ld)) {
-      loop_dim_to_inter_dim[ld] = inter_dim++;
-      inter_shape.push_back(output_shape[r]);
-    }
-  }
-  // Build the g1 output map: one result per intermediate-tensor dim, in order.
-  SmallVector<AffineExpr> g1_out_exprs(inter_dim);
-  for (auto& [ld, id] : loop_dim_to_inter_dim)
-    g1_out_exprs[id] = getAffineDimExpr(ld, ctx);
-  AffineMap g1_out_map = AffineMap::get(N, 0, g1_out_exprs, ctx);
-
-  // ── Generic 1 iterator types ─────────────────────────────────────────────
-  // across-stick → reduction, in-stick → parallel, others → same as original.
-  SmallVector<utils::IteratorType> g1_iter_types(orig_iter_types);
+  // ── Build G2 ─────────────────────────────────────────────────────────────
+  // G2 loops over all original dims except the outer reduction dims, in
+  // original order.  This includes the inner dim (now a reduction) and any
+  // output-only dims.
+  // orig_to_g2_dim: original loop dim index → G2 loop dim index (0..M-1).
+  llvm::SmallDenseMap<unsigned, unsigned> orig_to_g2_dim;
+  unsigned g2_idx = 0;
   for (unsigned i = 0; i < N; ++i) {
-    if (in_stick_loop_dims.count(i))
-      g1_iter_types[i] = utils::IteratorType::parallel;
-    else if (across_stick_loop_dims.count(i))
-      g1_iter_types[i] = utils::IteratorType::reduction;
-    // parallel dims keep their original type
+    if (!outer_loop_dims.count(i)) orig_to_g2_dim[i] = g2_idx++;
   }
+  unsigned M = g2_idx;
 
-  // ── Build Generic 2 indexing maps ────────────────────────────────────────
-  // Generic 2 loops over M dims: original parallel dims + in-stick dims.
-  // We build a renaming: original loop dim → new G2 loop dim index,
-  // skipping across-stick dims.
-  llvm::SmallDenseMap<unsigned, unsigned> loop_dim_to_g2_dim;
-  unsigned g2_dim = 0;
-  for (unsigned i = 0; i < N; ++i) {
-    if (!across_stick_loop_dims.count(i)) loop_dim_to_g2_dim[i] = g2_dim++;
-  }
-  unsigned M = g2_dim;
-
-  // G2 input map: maps the G2 loop dim for each intermediate dim (identity).
-  // The intermediate dims are ordered the same way as loop_dim_to_inter_dim.
-  SmallVector<AffineExpr> g2_in_exprs(inter_dim);
-  for (auto& [ld, id] : loop_dim_to_inter_dim) {
-    unsigned g2d = loop_dim_to_g2_dim[ld];
-    g2_in_exprs[id] = getAffineDimExpr(g2d, ctx);
-  }
+  // G2 input map: maps G2's loop dims to the intermediate tensor slots.
+  unsigned inter_rank = static_cast<unsigned>(inter_shape.size());
+  SmallVector<AffineExpr> g2_in_exprs(inter_rank);
+  for (auto& [orig_ld, slot] : orig_ld_to_inter_slot)
+    g2_in_exprs[slot] = getAffineDimExpr(orig_to_g2_dim[orig_ld], ctx);
   AffineMap g2_in_map = AffineMap::get(M, 0, g2_in_exprs, ctx);
 
-  // G2 output map: remap the original output map using the G2 loop dim indices.
+  // G2 output map: remap the original output map into G2's loop dim space.
   SmallVector<AffineExpr> g2_out_exprs;
   for (unsigned r = 0; r < output_map.getNumResults(); ++r) {
-    auto dim_expr = dyn_cast<AffineDimExpr>(output_map.getResult(r));
-    assert(dim_expr && "output map result is not a pure dim expression");
-    unsigned ld = dim_expr.getPosition();
-    assert(loop_dim_to_g2_dim.count(ld) &&
-           "output dim maps to an across-stick loop dim — unexpected");
-    g2_out_exprs.push_back(getAffineDimExpr(loop_dim_to_g2_dim[ld], ctx));
+    unsigned orig_ld =
+        cast<AffineDimExpr>(output_map.getResult(r)).getPosition();
+    assert(orig_to_g2_dim.count(orig_ld) &&
+           "output dim maps to an outer loop dim — unexpected");
+    g2_out_exprs.push_back(getAffineDimExpr(orig_to_g2_dim[orig_ld], ctx));
   }
   AffineMap g2_out_map = AffineMap::get(M, 0, g2_out_exprs, ctx);
 
-  // ── Generic 2 iterator types ─────────────────────────────────────────────
+  // G2 iterator types: inner dim → reduction, all other non-outer dims →
+  // parallel.
   SmallVector<utils::IteratorType> g2_iter_types(M);
   for (unsigned i = 0; i < N; ++i) {
-    if (across_stick_loop_dims.count(i)) continue;
-    unsigned g2d = loop_dim_to_g2_dim[i];
-    g2_iter_types[g2d] = in_stick_loop_dims.count(i)
-                             ? utils::IteratorType::reduction
-                             : utils::IteratorType::parallel;
+    if (outer_loop_dims.count(i)) continue;
+    g2_iter_types[orig_to_g2_dim[i]] = inner_loop_dims.count(i)
+                                           ? utils::IteratorType::reduction
+                                           : utils::IteratorType::parallel;
   }
 
   // ── Emit intermediate tensor initialiser ─────────────────────────────────
@@ -366,7 +328,7 @@ static void splitDim(CandidateInfo& info) {
       /*resultTensorTypes=*/TypeRange{inter_tensor_type},
       /*inputs=*/generic_op.getInputs(),
       /*outputs=*/ValueRange{inter_empty.getResult()},
-      ArrayRef<AffineMap>{input_map, g1_out_map}, g1_iter_types);
+      ArrayRef<AffineMap>{g1_in_map, g1_out_map}, g1_iter_types);
   cloneGenericBody(generic_op, g1);
 
   // ── Emit output tensor initialiser for Generic 2 ─────────────────────────
