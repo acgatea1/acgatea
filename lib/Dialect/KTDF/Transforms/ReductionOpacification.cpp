@@ -105,8 +105,8 @@ static void opaqifyReduction(linalg::GenericOp generic_op,
   opaque->setDiscardableAttr(
       builder.getStringAttr("dataflow_scheduler.register_names"),
       builder.getArrayAttr({
-          builder.getStringAttr("t0"),  // ins[0]
-          builder.getStringAttr("t0"),  // outs[0]
+          builder.getStringAttr("t0_0"),  // ins[0]
+          builder.getStringAttr("t0_0"),  // outs[0]
       }));
   opaque->setDiscardableAttr(
       builder.getStringAttr("parameter_dictionary"),
