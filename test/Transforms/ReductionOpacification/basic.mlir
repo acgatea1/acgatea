@@ -77,7 +77,7 @@
 // CHECK-NEXT:                     linalg.yield %[[ADDF_0]] : f16
 // CHECK-NEXT:                   }
 // CHECK-NEXT:                 } {loop_type = #ktdf.loop_type<reduction_loop>}
-// CHECK-NEXT:                 ktdf.opaque "simd_reduction"
+// CHECK-NEXT:                 ktdf.opaque "simd_reduction" {dataflow_scheduler.register_names = ["t0", "t0"], func_name = "simdreduction", parameter_dictionary = {unroll = "1"}}
 // CHECK-NEXT:                   ins(%[[ALLOC_2]]: memref<1x64xf16, "SFU_REG">)
 // CHECK-NEXT:                   outs(%[[ALLOC_2]]: memref<1x64xf16, "SFU_REG">)
 // CHECK-NEXT:                 ktdf.write_to_fifo %[[ALLOC_2]], %[[VAL_6]]#1 : memref<1x64xf16, "SFU_REG">, <"SFU" -> "L1SU", 64xf16>

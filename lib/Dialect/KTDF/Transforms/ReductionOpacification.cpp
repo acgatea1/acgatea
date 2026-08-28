@@ -30,6 +30,7 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Pass/Pass.h"
 
@@ -90,12 +91,27 @@ static void opaqifyReduction(linalg::GenericOp generic_op,
 
   OpBuilder builder(generic_op);
   // No result tensors: the opaque op writes in-place through outs(%alloc).
-  ktdf::OpaqueOp::create(builder, generic_op.getLoc(),
-                         /*resultTypes=*/TypeRange{},
-                         /*template_name=*/
-                         builder.getStringAttr("simd_reduction"),
-                         /*inputs=*/ValueRange{alloc},
-                         /*outputs=*/ValueRange{alloc});
+  auto* ctx = builder.getContext();
+  auto opaque = ktdf::OpaqueOp::create(builder, generic_op.getLoc(),
+                                       /*resultTypes=*/TypeRange{},
+                                       /*template_name=*/
+                                       builder.getStringAttr("simd_reduction"),
+                                       /*inputs=*/ValueRange{alloc},
+                                       /*outputs=*/ValueRange{alloc});
+
+  // Discardable attributes required by LowerOpaquePattern in KTDFLowToDFIR.
+  opaque->setDiscardableAttr(builder.getStringAttr("func_name"),
+                             builder.getStringAttr("simdreduction"));
+  opaque->setDiscardableAttr(
+      builder.getStringAttr("dataflow_scheduler.register_names"),
+      builder.getArrayAttr({
+          builder.getStringAttr("t0"),  // ins[0]
+          builder.getStringAttr("t0"),  // outs[0]
+      }));
+  opaque->setDiscardableAttr(
+      builder.getStringAttr("parameter_dictionary"),
+      DictionaryAttr::get(
+          ctx, {builder.getNamedAttr("unroll", builder.getStringAttr("1"))}));
 
   generic_op.erase();
   // Erase the subview only after the generic that used it is gone.
