@@ -87,6 +87,7 @@
 #include "dataflow-scheduler/Dialect/KTDF/KTDF.h"
 #include "dataflow-scheduler/Dialect/KTDF/Transforms/Passes.h"
 #include "dataflow-scheduler/Dialect/KTDFArch/Analysis/DeviceManager.h"
+#include "llvm/ADT/APFloat.h"
 #include "llvm/Support/DebugLog.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
@@ -126,15 +127,87 @@ static bool hasReductionIterator(linalg::GenericOp generic_op) {
 }
 
 // ---------------------------------------------------------------------------
+// Return the typed neutral-element attribute for the reduction combiner of
+// `generic_op`.
+//
+// The combiner is identified as the unique user of the output block argument
+// (outs[0], the last block argument) — that is the accumulation step.  Any
+// other ops in the body (e.g. element-wise pre-processing in a fused generic)
+// are irrelevant.
+//
+// Neutral elements per combiner:
+//   addf / subf  →  0.0
+//   mulf         →  1.0
+//   maximumf     → -inf
+//   minimumf     → +inf
+//   maxnumf      → -inf
+//   addi / subi  →  0
+//   muli         →  1
+//
+// Returns failure() (with an emitted error) if the output block argument has
+// zero or multiple users, the combiner is unrecognised, or the element type is
+// unsupported.
+// ---------------------------------------------------------------------------
+static FailureOr<TypedAttr> getNeutralAttr(linalg::GenericOp generic_op,
+                                           Type elem_type) {
+  // The output block argument is the last argument of the body block.
+  Value out_arg = generic_op.getRegion().front().getArguments().back();
+
+  // The combiner is the unique op that uses out_arg as an operand.
+  Operation* combiner =
+      out_arg.hasOneUse() ? out_arg.getUses().begin()->getOwner() : nullptr;
+  if (!combiner)
+    return generic_op.emitError(
+        "MapReductionPartials: output block argument of reduction "
+        "linalg.generic must have exactly one user (the accumulation op)");
+
+  // ── Floating-point combiners ───────────────────────────────────────────────
+  if (auto ftype = dyn_cast<FloatType>(elem_type)) {
+    const llvm::fltSemantics& sem = ftype.getFloatSemantics();
+    if (isa<arith::AddFOp, arith::SubFOp>(combiner))
+      return cast<TypedAttr>(
+          FloatAttr::get(elem_type, APFloat::getZero(sem, /*negative=*/false)));
+    if (isa<arith::MulFOp>(combiner))
+      return cast<TypedAttr>(FloatAttr::get(elem_type, APFloat(sem, 1)));
+    if (isa<arith::MaximumFOp, arith::MaxNumFOp>(combiner))
+      return cast<TypedAttr>(FloatAttr::get(
+          elem_type, APFloat::getLargest(sem, /*negative=*/true)));
+    if (isa<arith::MinimumFOp>(combiner))
+      return cast<TypedAttr>(FloatAttr::get(
+          elem_type, APFloat::getLargest(sem, /*negative=*/false)));
+    return combiner->emitError(
+        "MapReductionPartials: unsupported floating-point reduction combiner");
+  }
+
+  // ── Integer combiners ──────────────────────────────────────────────────────
+  if (auto itype = dyn_cast<IntegerType>(elem_type)) {
+    unsigned width = itype.getWidth();
+    if (isa<arith::AddIOp, arith::SubIOp>(combiner))
+      return cast<TypedAttr>(IntegerAttr::get(elem_type, APInt(width, 0)));
+    if (isa<arith::MulIOp>(combiner))
+      return cast<TypedAttr>(IntegerAttr::get(elem_type, APInt(width, 1)));
+    return combiner->emitError(
+        "MapReductionPartials: unsupported integer reduction combiner");
+  }
+
+  return generic_op.emitError(
+      "MapReductionPartials: unsupported accumulator element type — "
+      "expected float or integer");
+}
+
+// ---------------------------------------------------------------------------
 // Transform the initializer `init_val` of a loop-carried accumulator in-place,
 // emitting linalg.fill (or memref.copy) into `alloc_val` wherever the original
 // tensor value was produced.  `alloc_val` is a memref.alloc already emitted at
 // the top of the stage.
 //
+// `generic_op` is the reduction linalg.generic whose combiner determines the
+// correct neutral element for the fill.
+//
 // Three leaf cases are handled; scf.if recurses into both branches:
 //
 //   tensor.empty()
-//     → linalg.fill(%zero, %alloc) inserted just before the tensor.empty,
+//     → linalg.fill(%neutral, %alloc) inserted just before the tensor.empty,
 //       then the tensor.empty is erased.
 //
 //   ktdf.read_from_fifo ... -> tensor<...>
@@ -146,7 +219,8 @@ static bool hasReductionIterator(linalg::GenericOp generic_op) {
 //       operand 0), drop the yield operands so both yields become result-less,
 //       then rebuild the scf.if with no result types.
 // ---------------------------------------------------------------------------
-static LogicalResult lowerIterArgInitializer(Value init_val, Value alloc_val) {
+static LogicalResult lowerIterArgInitializer(Value init_val, Value alloc_val,
+                                             linalg::GenericOp generic_op) {
   Operation* defining_op = init_val.getDefiningOp();
   assert(defining_op &&
          "lowerIterArgInitializer: init_val must be an op result");
@@ -155,11 +229,13 @@ static LogicalResult lowerIterArgInitializer(Value init_val, Value alloc_val) {
 
   // ── Case: tensor.empty ────────────────────────────────────────────────────
   if (auto empty_op = dyn_cast<tensor::EmptyOp>(defining_op)) {
+    auto neutral = getNeutralAttr(generic_op, elem_type);
+    if (failed(neutral)) return failure();
     OpBuilder builder(empty_op);
     Location loc = empty_op.getLoc();
-    Value zero = arith::ConstantOp::create(
-        builder, loc, builder.getFloatAttr(elem_type, 0.0));
-    linalg::FillOp::create(builder, loc, ValueRange{zero},
+    Value neutral_val =
+        arith::ConstantOp::create(builder, loc, neutral.value());
+    linalg::FillOp::create(builder, loc, ValueRange{neutral_val},
                            ValueRange{alloc_val});
     empty_op->erase();
     return success();
@@ -189,7 +265,7 @@ static LogicalResult lowerIterArgInitializer(Value init_val, Value alloc_val) {
           cast<scf::YieldOp>(if_op.getThenRegion().front().getTerminator());
       Value then_init = then_yield.getOperand(0);
       then_yield->setOperands({});
-      if (failed(lowerIterArgInitializer(then_init, alloc_val)))
+      if (failed(lowerIterArgInitializer(then_init, alloc_val, generic_op)))
         return failure();
     }
 
@@ -198,7 +274,7 @@ static LogicalResult lowerIterArgInitializer(Value init_val, Value alloc_val) {
           cast<scf::YieldOp>(if_op.getElseRegion().front().getTerminator());
       Value else_init = else_yield.getOperand(0);
       else_yield->setOperands({});
-      if (failed(lowerIterArgInitializer(else_init, alloc_val)))
+      if (failed(lowerIterArgInitializer(else_init, alloc_val, generic_op)))
         return failure();
     }
 
@@ -387,7 +463,8 @@ static LogicalResult rewriteGeneric(
 
   // Step 4b: lower the initializer — emit linalg.fill (and/or memref.copy) in
   // the right place and clean up tensor ops.
-  if (failed(lowerIterArgInitializer(outermost_init, alloc.getResult())))
+  if (failed(lowerIterArgInitializer(outermost_init, alloc.getResult(),
+                                     generic_op)))
     return failure();
 
   // Step 5: emit a new ktdf.read_from_fifo with a memref result type so the
