@@ -30,12 +30,12 @@
 // CHECK-NEXT:       %[[REINTERPRET_CAST_1:.*]] = memref.reinterpret_cast %[[MEMORY_SPACE_CAST_1]] to offset: [0], sizes: [256, 64], strides: [64, 1] : memref<256x64xf16, #ktdp.memory_space<global>> to memref<256x64xf16, strided<[64, 1]>, #ktdp.memory_space<global>>
 // CHECK-NEXT:       %[[CAST_1:.*]] = memref.cast %[[REINTERPRET_CAST_1]] : memref<256x64xf16, strided<[64, 1]>, #ktdp.memory_space<global>> to memref<256x64xf16, strided<[64, 1], offset: ?>, #ktdp.memory_space<global>>
 // CHECK-NEXT:       ktdf.pipeline {
-// CHECK-NEXT:         %[[PRIVATE_0:.*]]:4 = ktdf.private -> (memref<256x2x1x64xf16, #ktdp.memory_space<ct_local>>, memref<1x64xf16, #ktdp.memory_space<ct_local>>, !ktdf.token, !ktdf.token) {
+// CHECK-NEXT:         %[[PRIVATE_0:.*]]:4 = ktdf.private -> (memref<256x2x1x64xf16, #ktdp.memory_space<ct_local>>, memref<256x1x64xf16, #ktdp.memory_space<ct_local>>, !ktdf.token, !ktdf.token) {
 // CHECK-NEXT:           %[[ALLOC_0:.*]] = memref.alloc() : memref<256x2x1x64xf16, #ktdp.memory_space<ct_local>>
-// CHECK-NEXT:           %[[ALLOC_1:.*]] = memref.alloc() : memref<1x64xf16, #ktdp.memory_space<ct_local>>
+// CHECK-NEXT:           %[[ALLOC_1:.*]] = memref.alloc() : memref<256x1x64xf16, #ktdp.memory_space<ct_local>>
 // CHECK-NEXT:           %[[CREATE_TOKEN_0:.*]] = ktdf.create_token : !ktdf.token
 // CHECK-NEXT:           %[[CREATE_TOKEN_1:.*]] = ktdf.create_token : !ktdf.token
-// CHECK-NEXT:           ktdf.private_yield %[[ALLOC_0]], %[[ALLOC_1]], %[[CREATE_TOKEN_0]], %[[CREATE_TOKEN_1]] : memref<256x2x1x64xf16, #ktdp.memory_space<ct_local>>, memref<1x64xf16, #ktdp.memory_space<ct_local>>, !ktdf.token, !ktdf.token
+// CHECK-NEXT:           ktdf.private_yield %[[ALLOC_0]], %[[ALLOC_1]], %[[CREATE_TOKEN_0]], %[[CREATE_TOKEN_1]] : memref<256x2x1x64xf16, #ktdp.memory_space<ct_local>>, memref<256x1x64xf16, #ktdp.memory_space<ct_local>>, !ktdf.token, !ktdf.token
 // CHECK-NEXT:         }
 // CHECK-NEXT:         ktdf.stage depends_in(none) depends_out(%[[VAL_0:.*]]#2) {
 // CHECK-NEXT:           scf.for %[[VAL_1:.*]] = %[[CONSTANT_0]] to %[[CONSTANT_3]] step %[[CONSTANT_1]] {
@@ -93,7 +93,7 @@
 // CHECK-NEXT:                   %[[DIVSI_2:.*]] = arith.divsi %[[SUBI_2]], %[[CONSTANT_1]] : index
 // CHECK-NEXT:                   %[[CMPI_0:.*]] = arith.cmpi eq, %[[VAL_13]], %[[CONSTANT_6]] : index
 // CHECK-NEXT:                   scf.if %[[CMPI_0]] {
-// CHECK-NEXT:                     ktdf.data_transfer from %[[VAL_12]]#1 size [1, 64] to %[[VAL_2]]#1[0, 0] size [1, 64] : !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, memref<1x64xf16, #ktdp.memory_space<ct_local>>
+// CHECK-NEXT:                     ktdf.data_transfer from %[[VAL_12]]#1 size [1, 64] to %[[VAL_2]]#1{{\[}}%[[DIVSI_2]], 0, 0] size [1, 1, 64] : !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, memref<256x1x64xf16, #ktdp.memory_space<ct_local>>
 // CHECK-NEXT:                   }
 // CHECK-NEXT:                 } {loop_type = #ktdf.loop_type<reduction_loop>}
 // CHECK-NEXT:               } {applicable_units = ["L1SU"]}
@@ -104,7 +104,7 @@
 // CHECK-NEXT:           scf.for %[[VAL_15:.*]] = %[[CONSTANT_0]] to %[[CONSTANT_3]] step %[[CONSTANT_1]] {
 // CHECK-NEXT:             %[[SUBI_3:.*]] = arith.subi %[[VAL_15]], %[[CONSTANT_0]] : index
 // CHECK-NEXT:             %[[DIVSI_3:.*]] = arith.divsi %[[SUBI_3]], %[[CONSTANT_1]] : index
-// CHECK-NEXT:             ktdf.data_transfer from %[[VAL_14]]#1[0, 0] size [1, 64] to %[[CAST_1]]{{\[}}%[[VAL_15]], %[[CONSTANT_0]] * 64] size [1, 64] : memref<1x64xf16, #ktdp.memory_space<ct_local>>, memref<256x64xf16, strided<[64, 1], offset: ?>, #ktdp.memory_space<global>>
+// CHECK-NEXT:             ktdf.data_transfer from %[[VAL_14]]#1{{\[}}%[[DIVSI_3]], 0, 0] size [1, 1, 64] to %[[CAST_1]]{{\[}}%[[VAL_15]], %[[CONSTANT_0]] * 64] size [1, 64] : memref<256x1x64xf16, #ktdp.memory_space<ct_local>>, memref<256x64xf16, strided<[64, 1], offset: ?>, #ktdp.memory_space<global>>
 // CHECK-NEXT:           } {loop_type = #ktdf.loop_type<parallel_loop>}
 // CHECK-NEXT:         } {applicable_units = ["MNISU"]}
 // CHECK-NEXT:       }

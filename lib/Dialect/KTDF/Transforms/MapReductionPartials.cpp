@@ -70,8 +70,7 @@
 // size on parallel dims) is used as the outs buffer; ins is the full %alloc_G1.
 // After the reduction, the full %alloc_G1 — not the subview — is written to
 // the FIFO so the downstream stage receives all partial sums.
-// The FIFO slot type and the paired memref.alloc in the ktdf.private block are
-// widened to match %alloc_G1's shape.
+// The FIFO slot type is widened to match %alloc_G1's shape.
 //
 //   %sv = memref.subview %alloc_G1[0,...][D0,...,1,...][1,...]
 //             : memref<D0x...xDNxf16, ms> to memref<D0x...xDN-1xf16, strided,
@@ -530,81 +529,24 @@ static void widenPrivateResult(Value priv_res, Type new_type) {
 
 // ---------------------------------------------------------------------------
 // Iterate the direct uses of `fifo_slot` and for each data_transfer that
-// references it:
-//   - update both static size fields (fifo side and alloc side),
-//   - rebuild the alloc-side affine map to match the new rank,
-//   - widen the paired PrivateOp result and its inner alloc.
-// Early-exits per transfer if the alloc is already the target type.
+// references it update the FIFO-side static size field to reflect `new_shape`.
 // ---------------------------------------------------------------------------
 static void widenFifoUses(Value fifo_slot, ArrayRef<int64_t> new_shape,
-                          Type new_elem_type, MLIRContext* ctx) {
+                          MLIRContext* ctx) {
   auto new_sizes_attr = DenseI64ArrayAttr::get(ctx, new_shape);
-
-  // Build a zero-constant affine map for the alloc side of a transfer,
-  // preserving the number of dim inputs to match the existing dynamic indices.
-  auto makeZeroMap = [&](unsigned num_dims) -> AffineMapAttr {
-    SmallVector<AffineExpr> zero_exprs(new_shape.size(),
-                                       getAffineConstantExpr(0, ctx));
-    return AffineMapAttr::get(AffineMap::get(num_dims, 0, zero_exprs, ctx));
-  };
 
   for (Operation* user : fifo_slot.getUsers()) {
     auto xfer = dyn_cast<ktdf::DataTransferOp>(user);
     if (!xfer) continue;
 
-    // Determine which end carries the alloc; update both size fields and
-    // rebuild the alloc-side map to match the widened rank, preserving the
-    // number of dynamic index operands on that side.
-    Value alloc_side;
-    if (xfer.isSourceFifo()) {
+    // Only update the FIFO-side size on this transfer.  The alloc side (its
+    // size, map, and type) is left entirely unchanged — the alloc's shape is
+    // determined by its own allocation context and is shared with other
+    // transfers (e.g. the L3SU store-out) that must not be disturbed.
+    if (xfer.isSourceFifo())
       xfer.setStaticSourceSizesAttr(new_sizes_attr);
+    else if (xfer.isDestFifo())
       xfer.setStaticDestSizesAttr(new_sizes_attr);
-      xfer.setDestMapAttr(makeZeroMap(xfer.getDestIndices().size()));
-      alloc_side = xfer.getDestination();
-    } else if (xfer.isDestFifo()) {
-      xfer.setStaticDestSizesAttr(new_sizes_attr);
-      xfer.setStaticSourceSizesAttr(new_sizes_attr);
-      xfer.setSourceMapAttr(makeZeroMap(xfer.getSourceIndices().size()));
-      alloc_side = xfer.getSource();
-    } else {
-      continue;
-    }
-
-    // alloc_side must be a PrivateOp result; skip anything else.
-    auto priv_result = dyn_cast<OpResult>(alloc_side);
-    if (!priv_result) continue;
-    if (!isa<ktdf::PrivateOp>(priv_result.getOwner())) continue;
-    // Preserve the existing memory space — only the shape changes.
-    auto existing_memref = cast<MemRefType>(alloc_side.getType());
-    auto new_alloc_type =
-        MemRefType::get(new_shape, new_elem_type, MemRefLayoutAttrInterface{},
-                        existing_memref.getMemorySpace());
-    if (alloc_side.getType() == new_alloc_type) continue;  // no widening needed
-    widenPrivateResult(alloc_side, new_alloc_type);
-
-    // Fix any other data_transfer that references alloc_side as source or
-    // destination but was not reached via the fifo_slot use-list (e.g. a
-    // memref→memref store-out transfer downstream of the widened alloc).
-    for (Operation* alloc_user : alloc_side.getUsers()) {
-      auto other_xfer = dyn_cast<ktdf::DataTransferOp>(alloc_user);
-      if (!other_xfer || other_xfer == xfer) continue;
-      if (other_xfer.getSource() == alloc_side) {
-        if (auto src_map = other_xfer.getSourceMapAttr())
-          if (src_map.getValue().getNumResults() != new_shape.size()) {
-            other_xfer.setSourceMapAttr(
-                makeZeroMap(other_xfer.getSourceIndices().size()));
-            other_xfer.setStaticSourceSizesAttr(new_sizes_attr);
-          }
-      }
-      if (other_xfer.getDestination() == alloc_side) {
-        if (auto dst_map = other_xfer.getDestMapAttr())
-          if (dst_map.getValue().getNumResults() != new_shape.size()) {
-            other_xfer.setDestMapAttr(
-                makeZeroMap(other_xfer.getDestIndices().size()));
-            other_xfer.setStaticDestSizesAttr(new_sizes_attr);
-          }
-      }
-    }
   }
 }
 
@@ -760,10 +702,9 @@ static LogicalResult rewriteInnerDimGeneric(linalg::GenericOp generic_op) {
     // Widen the PrivateOp result for the fifo slot (and its inner allocate).
     widenPrivateResult(old_fifo_slot, new_slot_type);
 
-    // Update all data_transfer uses of the fifo slot and widen the paired
-    // memref.alloc in the ktdf.private block for each transfer.
-    // The memory space of each alloc is preserved inside widenFifoUses.
-    widenFifoUses(old_fifo_slot, in_shape, elem_type, generic_op.getContext());
+    // Update the FIFO-side size on all data_transfer uses of the fifo slot.
+    // The paired alloc in ktdf.private is intentionally left unchanged.
+    widenFifoUses(old_fifo_slot, in_shape, generic_op.getContext());
   }
 
   // Erase the original tensor.empty output initializer and the tensor generic.
