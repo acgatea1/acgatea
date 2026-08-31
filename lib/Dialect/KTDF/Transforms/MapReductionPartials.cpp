@@ -596,31 +596,35 @@ static LogicalResult rewriteInnerDimGeneric(linalg::GenericOp generic_op) {
     loop_dim_to_size[dim_expr.getPosition()] = in_shape[d];
   }
 
-  // Build the subview over the *output* map's dimensions — the subview is the
-  // outs operand and must match the output indexing map's result rank.
+  // SubViewOp requires offsets/sizes/strides arrays of length == source rank
+  // (in_rank).  The rank reduction is expressed by placing
+  // size=1 on reduction dimensions; inferRankReducedResultType then produces
+  // the correctly strided result type with the reduced rank.
   unsigned out_rank = out_map.getNumResults();
-  SmallVector<int64_t> sv_sizes(out_rank);
+
+  // Build source-rank-sized arrays by iterating over the input map: each
+  // source dim d maps to loop dim loop_dim; if that loop dim is a reduction
+  // iterator set size=1 (to be dropped), otherwise keep the full size.
+  SmallVector<OpFoldResult> sv_offsets(in_rank, builder.getIndexAttr(0));
+  SmallVector<OpFoldResult> sv_sizes_ofr(in_rank);
+  SmallVector<OpFoldResult> sv_strides(in_rank, builder.getIndexAttr(1));
+  for (unsigned d = 0; d < in_rank; ++d) {
+    auto dim_expr = dyn_cast<AffineDimExpr>(in_map.getResult(d));
+    assert(dim_expr && "inner-dim input map must be identity-like");
+    unsigned loop_dim = dim_expr.getPosition();
+    int64_t sz = (iter_types[loop_dim] == utils::IteratorType::reduction)
+                     ? 1
+                     : loop_dim_to_size[loop_dim];
+    sv_sizes_ofr[d] = builder.getIndexAttr(sz);
+  }
+
+  // Rank-reduced result shape: parallel dims only, in out_map order, so the
+  // subview result rank matches the output indexing map.
+  SmallVector<int64_t> sv_result_shape;
   for (unsigned d = 0; d < out_rank; ++d) {
     auto dim_expr = dyn_cast<AffineDimExpr>(out_map.getResult(d));
     assert(dim_expr && "inner-dim output map must be identity-like");
     unsigned loop_dim = dim_expr.getPosition();
-    sv_sizes[d] = (iter_types[loop_dim] == utils::IteratorType::reduction)
-                      ? 1
-                      : loop_dim_to_size[loop_dim];
-  }
-
-  SmallVector<OpFoldResult> sv_offsets(out_rank, builder.getIndexAttr(0));
-  SmallVector<OpFoldResult> sv_sizes_ofr;
-  for (int64_t sz : sv_sizes) sv_sizes_ofr.push_back(builder.getIndexAttr(sz));
-  SmallVector<OpFoldResult> sv_strides(out_rank, builder.getIndexAttr(1));
-
-  // Rank-reduced result shape: drop only reduction dims (those set to size 1
-  // above).  Parallel dims that happen to be size 1 must be kept so the result
-  // rank matches the output indexing map.
-  SmallVector<int64_t> sv_result_shape;
-  for (unsigned d = 0; d < out_rank; ++d) {
-    auto dim_expr = dyn_cast<AffineDimExpr>(out_map.getResult(d));
-    unsigned loop_dim = dim_expr ? dim_expr.getPosition() : out_rank;
     if (iter_types[loop_dim] != utils::IteratorType::reduction)
       sv_result_shape.push_back(loop_dim_to_size[loop_dim]);
   }
