@@ -57,7 +57,8 @@ namespace {
 
 // Returns success (and no results) when `op` is a linalg.generic whose
 // rightmost input map dimension maps to a reduction iterator — i.e. it is the
-// inner-dim reduction generic produced by MapReductionPartials.
+// inner-dim reduction generic produced by MapReductionPartials — and whose
+// single output operand is defined by a memref.subview.
 auto ktdfIsInnerDimReduction(mlir::PatternRewriter& /*rewriter*/,
                              mlir::PDLResultList& /*results*/,
                              llvm::ArrayRef<mlir::PDLValue> values)
@@ -82,6 +83,28 @@ auto ktdfIsInnerDimReduction(mlir::PatternRewriter& /*rewriter*/,
       mlir::utils::IteratorType::reduction)
     return mlir::failure();
 
+  // The output must be a rank-reducing subview produced by
+  // MapReductionPartials.
+  if (generic.getOutputs().empty()) return mlir::failure();
+  if (!llvm::isa_and_nonnull<mlir::memref::SubViewOp>(
+          generic.getOutputs().front().getDefiningOp()))
+    return mlir::failure();
+
+  return mlir::success();
+}
+
+// Rewrite helper: ktdf.subview_source(value) → Value
+// Returns the source operand of the memref.subview that defines `value`.
+auto ktdfSubviewSource(mlir::PatternRewriter& /*rewriter*/,
+                       mlir::PDLResultList& results,
+                       llvm::ArrayRef<mlir::PDLValue> values)
+    -> mlir::LogicalResult {
+  assert(values.size() == 1);
+  auto val = values[0].cast<mlir::Value>();
+  auto subview =
+      llvm::dyn_cast_if_present<mlir::memref::SubViewOp>(val.getDefiningOp());
+  if (!subview) return mlir::failure();
+  results.push_back(subview.getSource());
   return mlir::success();
 }
 
@@ -152,6 +175,7 @@ class PatternCache : public mlir::ktdf_arch::PatternCache {
                                         ktdfIsInnerDimReduction);
     patterns.registerConstraintFunction("ktdf.is_reduction_kind",
                                         ktdfIsReductionKind);
+    patterns.registerRewriteFunction("ktdf.subview_source", ktdfSubviewSource);
   }
 
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PatternCache)
