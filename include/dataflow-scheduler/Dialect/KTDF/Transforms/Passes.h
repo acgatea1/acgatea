@@ -38,7 +38,6 @@ auto createBroadcastPromotionPass() -> std::unique_ptr<Pass>;
 
 auto createMapReductionPartialsPass() -> std::unique_ptr<Pass>;
 
-auto createReductionOpacificationPass() -> std::unique_ptr<Pass>;
 
 auto createReductionDimChunkingPass() -> std::unique_ptr<Pass>;
 

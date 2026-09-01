@@ -20,9 +20,13 @@
 #include <llvm/Support/DebugLog.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
+#include <mlir/Dialect/Linalg/IR/Linalg.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
 #include <mlir/Dialect/PDL/IR/PDL.h>
 #include <mlir/Dialect/PDLInterp/IR/PDLInterp.h>
+#include <mlir/IR/AffineExpr.h>
+#include <mlir/IR/AffineMap.h>
+#include <mlir/IR/BuiltinTypes.h>
 #include <mlir/Pass/Pass.h>
 #include <mlir/Support/TypeID.h>
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
@@ -49,6 +53,36 @@ namespace scheduler {
 
 namespace {
 
+// Returns success (and no results) when `op` is a linalg.generic whose
+// rightmost input map dimension maps to a reduction iterator — i.e. it is the
+// inner-dim reduction generic produced by MapReductionPartials.
+auto ktdfIsInnerDimReduction(mlir::PatternRewriter& /*rewriter*/,
+                              mlir::PDLResultList& /*results*/,
+                              llvm::ArrayRef<mlir::PDLValue> values)
+    -> mlir::LogicalResult {
+  assert(values.size() == 1);
+  auto generic = llvm::dyn_cast_if_present<mlir::linalg::GenericOp>(
+      values[0].cast<mlir::Operation*>());
+  if (!generic || generic.getInputs().empty()) return mlir::failure();
+
+  auto input_type =
+      mlir::dyn_cast<mlir::MemRefType>(generic.getInputs().front().getType());
+  if (!input_type) return mlir::failure();
+
+  mlir::AffineMap input_map = generic.getIndexingMapsArray().front();
+  int64_t last = input_type.getRank() - 1;
+  auto dim_expr =
+      mlir::dyn_cast<mlir::AffineDimExpr>(input_map.getResult(last));
+  if (!dim_expr) return mlir::failure();
+
+  unsigned loop_dim = dim_expr.getPosition();
+  if (generic.getIteratorTypesArray()[loop_dim] !=
+      mlir::utils::IteratorType::reduction)
+    return mlir::failure();
+
+  return mlir::success();
+}
+
 class PatternCache : public mlir::ktdf_arch::PatternCache {
  public:
   using mlir::ktdf_arch::PatternCache::PatternCache;
@@ -56,7 +90,8 @@ class PatternCache : public mlir::ktdf_arch::PatternCache {
   void registerNativeFunctions(mlir::PDLPatternModule& patterns) final {
     mlir::ktdf_arch::PatternCache::registerNativeFunctions(patterns);
 
-    // TODO: Register additional native functions.
+    patterns.registerConstraintFunction("ktdf.is_inner_dim_reduction",
+                                        ktdfIsInnerDimReduction);
   }
 
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(PatternCache)
