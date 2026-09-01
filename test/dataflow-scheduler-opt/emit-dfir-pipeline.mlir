@@ -54,7 +54,7 @@
 // CHECK-NEXT:   subsume-linearize-index
 // CHECK-NEXT:   builtin.module(
 // CHECK-NEXT:   func.func(
-// CHECK-NEXT:   apply-device-patterns{groups={reduction_opacification}}
+// CHECK-NEXT:   apply-device-patterns{groups={post_scheduling}}
 // CHECK-NEXT:   )
 // CHECK-NEXT:   )
 // CHECK-NEXT:   address-assignment
