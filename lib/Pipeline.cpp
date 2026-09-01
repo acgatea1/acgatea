@@ -106,7 +106,7 @@ void scheduler::buildSchedulerOptimizationPipeline(
   //     and materialized concrete trip counts.
   //  -> Apply patterns that add/remove allocations or coalesce FIFOs.
   pm.nest<mlir::ModuleOp>().addNestedPass<mlir::func::FuncOp>(
-      createApplyDevicePatternsPass({"reduction_opacification"}));
+      createApplyDevicePatternsPass({"post_scheduling"}));
 
   pm.addPass(createAddressAssignmentPass(scheduler_ctx));
   // TODO: position of cross-instance parallelization is TBD
