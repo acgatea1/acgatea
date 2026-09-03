@@ -170,10 +170,10 @@ static FailureOr<TypedAttr> getNeutralAttr(linalg::GenericOp generic_op,
       return cast<TypedAttr>(FloatAttr::get(elem_type, APFloat(sem, 1)));
     if (isa<arith::MaximumFOp, arith::MaxNumFOp>(combiner))
       return cast<TypedAttr>(FloatAttr::get(
-          elem_type, APFloat::getLargest(sem, /*negative=*/true)));
+          elem_type, APFloat::getInf(sem, /*negative=*/true)));
     if (isa<arith::MinimumFOp>(combiner))
       return cast<TypedAttr>(FloatAttr::get(
-          elem_type, APFloat::getLargest(sem, /*negative=*/false)));
+          elem_type, APFloat::getInf(sem, /*negative=*/false)));
     return combiner->emitError(
         "MapReductionPartials: unsupported floating-point reduction combiner");
   }
