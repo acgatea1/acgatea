@@ -1,11 +1,12 @@
-// RUN: dataflow-scheduler-opt %s -allow-unregistered-dialect \
-// RUN:   -apply-device-patterns='groups=post_scheduling' \
-// RUN:   | FileCheck %s
+// RUN: dataflow-scheduler-opt %s -allow-unregistered-dialect -apply-device-patterns='groups=post_scheduling' | FileCheck %s
 
-// CHECK-LABEL: func.func @sum_reduction
-// CHECK-NOT:     linalg.generic
-// CHECK:         "test.simd_reduction_sum"(%[[IN:.*]], %[[ACC:.*]]) : (memref<64x32xf16, "L1">, memref<64xf16, "L1">) -> ()
-// CHECK-NOT:     memref.subview
+// CHECK-LABEL:   func.func @sum_reduction() {
+// CHECK-NEXT:     %[[ALLOC_0:.*]] = memref.alloc() : memref<64x32xf16, "L1">
+// CHECK-NEXT:     %[[ALLOC_1:.*]] = memref.alloc() : memref<64xf16, "L1">
+// CHECK-NEXT:     "test.simd_reduction_sum"(%[[ALLOC_0]], %[[ALLOC_1]]) : (memref<64x32xf16, "L1">, memref<64xf16, "L1">) -> ()
+// CHECK-NEXT:     return
+// CHECK-NEXT:   }
+
 
 // Verify that the post_scheduling PDL pattern in the sample device rewrites a
 // linalg.generic sum-reduction (inner-dim, output via subview) into a bare
