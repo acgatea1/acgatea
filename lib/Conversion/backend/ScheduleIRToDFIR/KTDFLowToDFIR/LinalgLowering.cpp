@@ -339,11 +339,14 @@ struct LowerLinalgGenericPattern
       mlir::PatternRewriter& rewriter) const {
     mlir::Location loc = generic_op.getLoc();
 
-    // Require exactly one body op (plus the linalg.yield terminator).
+    // Require exactly one body op (plus the linalg.yield terminator and
+    // possibly arith.constant ops).
     mlir::Block& body = generic_op.getRegion().front();
     llvm::SmallVector<mlir::Operation*> body_ops;
-    for (mlir::Operation& op : body.without_terminator())
+    for (mlir::Operation& op : body.without_terminator()) {
+      if (op.hasTrait<mlir::OpTrait::ConstantLike>()) continue;
       body_ops.push_back(&op);
+    }
     // Allow either one compute op or the abs_max pattern:
     //   math.absf %in  /  math.absf %out  /  arith.maxnumf %abs_in, %abs_out
     if (body_ops.size() != 1 && body_ops.size() != 3)
@@ -371,8 +374,6 @@ struct LowerLinalgGenericPattern
       binary_kind = mlir::vectorchain::VectorChainBinaryOperator::max;
     else if (mlir::isa<mlir::arith::MinimumFOp>(body_ops[0]))
       binary_kind = mlir::vectorchain::VectorChainBinaryOperator::min;
-    else if (mlir::isa<mlir::arith::MaxNumFOp>(body_ops[0]))
-      binary_kind = mlir::vectorchain::VectorChainBinaryOperator::max;
     else
       return body_ops[0]->emitError(
           "unsupported reduction body op in linalg.generic");
