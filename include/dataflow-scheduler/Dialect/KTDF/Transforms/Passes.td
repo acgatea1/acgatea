@@ -93,8 +93,9 @@ def ReductionLoopExposurePass : Pass<"reduction-loop-exposure", "mlir::ModuleOp"
   let description = [{
     Walks the module for any ktdf.stage that contains a linalg.generic with a
     reduction iterator (the Compute stage).  For each one found it rewrites the
-    parent ktdf.pipeline so that the outer reduction becomes one nested scf.for loop per reduction dimension, with the accumulator tensor
-    threaded as iter_args.
+    parent ktdf.pipeline so that the outer reduction becomes one nested scf.for
+    loop per reduction dimension, with the accumulator tensor threaded as
+    iter_args.
 
     The innermost reduction dimension — identified as the reduction loop dim
     that maps to the rightmost input tensor dimension — is excluded from loop
@@ -259,15 +260,21 @@ def MapReductionPartialsPass : Pass<"map-reduction-partials", "mlir::ModuleOp"> 
 }
 
 def ReductionDimChunkingPass : Pass<"reduction-dim-chunking", "mlir::ModuleOp"> {
-  let summary = "Split the reduction dimension of inner linalg.generic ops into sequential chunks";
+  let summary = "Split the outermost reduction dimension of inner linalg.generic ops into sequential chunks";
   let description = [{
     This pass targets the inner Load→Compute→Store pipeline that contains a
     linalg.generic with a reduction iterator.  It replaces that single
-    pipeline with nested scf.for loops — one per reduction dimension that
-    has more than one chunk — each innermost iteration containing one
-    ktdf.pipeline (Load / Compute / Store stages).
+    pipeline with one scf.for loop over the outermost reduction dimension's
+    chunk count, each iteration containing one ktdf.pipeline (Load / Compute /
+    Store stages).
+
+    Only the outermost reduction dimension (smallest loop-dim index) is
+    chunked.  If that dimension is also the inner dim (the rightmost input
+    tensor dimension, belonging to the hardware SIMD path), the pass skips
+    chunking entirely.  Inner reduction dims are left for other passes.
+
     First-vs-rest accumulation behaviour is selected at runtime via
-    `%condition = AND(iv_j == 0 for all active chunk loop IVs)`:
+    `%condition = (chunk_iv == 0)`:
 
       Load stage   : transfers the current input chunk slice to fifo_in.
                      When !condition, also transfers the partial accumulator
@@ -294,14 +301,12 @@ def ReductionDimChunkingPass : Pass<"reduction-dim-chunking", "mlir::ModuleOp"> 
     - The inner Compute stage body contains exactly one linalg.generic with
       at least one `reduction` iterator type.
 
-    Option `num-chunks` sets the static chunk count per reduction dim (one
-    value per dim, in iterator-type order).  Values may differ across dims;
-    the pass emits one nested scf.for per dim (dims with chunk count 1
-    produce no loop).  When omitted (the default), the pass infers the
-    chunk count automatically from the input tensor size and the
+    Option `num-chunks` sets the number of sequential chunks for the outermost
+    reduction dimension.  When omitted or set to 0 (the default), the pass
+    infers the chunk count automatically from the input tensor size and the
     `chunk-size-threshold` option: it picks the smallest integer N ≥ 1 such
     that (total_input_bytes / N) ≤ chunk-size-threshold AND N evenly divides
-    every reduction-dimension size.
+    the outermost reduction dimension size.
 
     Option `chunk-size-threshold` (default 1 MiB = 1048576 bytes) is the
     per-chunk byte budget used when `num-chunks` is not provided.  It is
@@ -309,12 +314,10 @@ def ReductionDimChunkingPass : Pass<"reduction-dim-chunking", "mlir::ModuleOp"> 
   }];
   let constructor = "::mlir::ktdf::createReductionDimChunkingPass()";
   let options = [
-    ListOption<"numChunks", "num-chunks", "unsigned",
-               "Number of sequential chunks per reduction dimension (one value "
-               "per reduction dim, in iterator-type order).  Values may differ "
-               "across dims; the pass emits one nested scf.for per dim (dims "
-               "with chunk count 1 produce no loop).  When empty (the default) "
-               "the pass infers the chunk count from chunk-size-threshold.">,
+    Option<"numChunks", "num-chunks", "unsigned",
+           "0",
+           "Number of sequential chunks for the outermost reduction dimension. "
+           "0 (the default) means auto-infer from chunk-size-threshold.">,
     Option<"chunkSizeThreshold", "chunk-size-threshold", "int64_t",
            "1048576",
            "Per-chunk size budget in bytes used for automatic numChunks "
