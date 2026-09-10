@@ -332,7 +332,7 @@ struct ReductionDimChunkingPass
 
   // -----------------------------------------------------------------------
   // Replace inner_pipeline with nested scf.for loops — one per reduction
-  // dimension whose num_chunks > 1.  Dimensions with num_chunks == 1 need no
+  // dimension whose num_chunks > 1. Dimensions with num_chunks == 1 need no
   // loop; their IV is treated as the constant 0 for offset and condition
   // computation.
   //
