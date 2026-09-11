@@ -51,10 +51,14 @@
 //                  When !condition, also transfers the partial accumulator
 //                  (local memory output buffer → fifo_partial) so the
 //                  Compute stage can read it back.
-//   Compute stage: when condition, initialises the output tensor with
-//                  tensor.empty; otherwise reads the partial result from
-//                  fifo_partial.  The linalg.generic and write_to_fifo are
-//                  unconditional.
+//   Compute stage: unconditionally reads fifo_in and runs a first
+//                  linalg.generic into tensor.empty.  Then branches on
+//                  condition:
+//                    then (first iter): yield first generic result.
+//                    else (later iters): read fifo_partial, run a second
+//                      linalg.generic(input=partial, output=first result),
+//                      yield second generic result.
+//                  The conditional result is written to fifo_out.
 //   Store stage  : unconditionally writes fifo_out back to the local memory
 //                  output buffer.
 //
