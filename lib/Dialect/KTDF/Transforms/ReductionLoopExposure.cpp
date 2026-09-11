@@ -43,8 +43,11 @@
 //      - tensor.empty is emitted before the outermost loop (accumulator init).
 //      - Each loop level carries the accumulator as iter_args; the value
 //        threads down to the innermost loop where linalg.generic runs.
-//      - write_to_fifo is wrapped in scf.if (all ivs == last) in the
-//        innermost loop body.
+//      - When the generic writes to a FIFO directly, write_to_fifo is wrapped
+//        in scf.if (all ivs == last) in the innermost loop body.
+//      - When the generic feeds downstream ops (e.g. an inner-dim reduction
+//        after SplitReductionInnerOuterDim), uses of the original generic are
+//        replaced with the outermost loop results.
 //      - The outermost loop is tagged {loop_type = reduction_loop}.
 //   9. Find the conditional-store stage via StageFactory::findStoreStage
 //      (downstream of compute via depends_out/depends_in token chain).
@@ -879,9 +882,8 @@ struct ReductionLoopExposurePass
   // reduction dim), each carrying the accumulator tensor as iter_arg.
   //
   // The accumulator is always seeded with tensor.empty before the outermost
-  // loop.  When a partial FIFO path exists (cross-chunk accumulation), a
-  // combine scf.if is emitted *after* the loop to merge the previous chunk's
-  // partial result into the loop output:
+  // loop.  Cross-chunk partial accumulation is the responsibility of the
+  // combine scf.if already present in the stage body.
   //
   //   %seed = tensor.empty()
   //   scf.for %r0 = 0 to D0 iter_args(%a0 = %seed) {loop_type = reduction}
@@ -892,14 +894,6 @@ struct ReductionLoopExposurePass
   //       scf.yield %updated
   //     ...
   //   scf.yield %r0_result
-  //   // (when fifo_in_partial):
-  //   %combined = scf.if %is_first -> tensor<...> {
-  //     scf.yield %r0_result          // first chunk: loop result is final
-  //   } else {
-  //     %p = ktdf.read_from_fifo fifo_in_partial
-  //     %g = linalg.generic(parallel, addf) ins(%p) outs(%r0_result)
-  //     scf.yield %g                  // subsequent chunks: add prior partial
-  //   }
   // -------------------------------------------------------------------------
   LogicalResult rewriteComputeStage(IRRewriter& rewriter, Location loc,
                                     MLIRContext* ctx, ktdf::StageOp stage,
@@ -964,66 +958,11 @@ struct ReductionLoopExposurePass
       inner_yield->setOperand(r, updated[r]);
     }
 
-    // Accumulation combining after loop: if there's a partial FIFO input,
-    // emit an scf.if after the loop where the else branch adds the partial
-    // FIFO value to the loop reduction result via a parallel linalg.generic.
     rewriter.setInsertionPointAfter(nested.outermost_loop);
 
     SmallVector<Value> final_results;
-    if (fifo_in_partial && is_first_chunk) {
-      if (results != 1) {
-        return generic_op.emitError(
-            PASS_NAME
-            ": a compute with more than one accumulator has no partial fifo "
-            "per accumulator to read the previous chunk from");
-      }
-      auto if_op =
-          scf::IfOp::create(rewriter, loc, TypeRange{output_tensor_type},
-                            is_first_chunk, /*withElseRegion=*/true);
-      {
-        Block& then_block = if_op.getThenRegion().front();
-        OpBuilder then_b = OpBuilder::atBlockBegin(&then_block);
-        scf::YieldOp::create(then_b, loc,
-                             ValueRange{nested.outermost_loop.getResult(0)});
-      }
-      {
-        Block& else_block = if_op.getElseRegion().front();
-        OpBuilder else_b = OpBuilder::atBlockBegin(&else_block);
-        auto partial_read = ktdf::ReadFromFifoOp::create(
-            else_b, loc, output_tensor_type, fifo_in_partial);
-
-        int64_t rank = output_tensor_type.getRank();
-        AffineMap id_map = else_b.getMultiDimIdentityMap(rank);
-        SmallVector<AffineMap> indexing_maps = {id_map, id_map};
-        SmallVector<utils::IteratorType> iter_types(
-            rank, utils::IteratorType::parallel);
-
-        auto add_generic = linalg::GenericOp::create(
-            else_b, loc, TypeRange{output_tensor_type},
-            /*inputs=*/ValueRange{partial_read.getResult()},
-            /*outputs=*/ValueRange{nested.outermost_loop.getResult(0)},
-            indexing_maps, iter_types,
-            [&](OpBuilder& b, Location b_loc, ValueRange args) {
-              Value in_val = args[0];
-              Value out_val = args[1];
-              Value sum_val;
-              Type elem_type = output_tensor_type.getElementType();
-              if (isa<FloatType>(elem_type)) {
-                sum_val = arith::AddFOp::create(b, b_loc, in_val, out_val);
-              } else {
-                sum_val = arith::AddIOp::create(b, b_loc, in_val, out_val);
-              }
-              linalg::YieldOp::create(b, b_loc, sum_val);
-            });
-
-        scf::YieldOp::create(else_b, loc, ValueRange{add_generic.getResult(0)});
-      }
-      final_results.push_back(if_op.getResult(0));
-    } else {
-      for (unsigned r = 0; r < results; ++r) {
-        final_results.push_back(nested.outermost_loop.getResult(r));
-      }
-    }
+    for (unsigned r = 0; r < results; ++r)
+      final_results.push_back(nested.outermost_loop.getResult(r));
 
     if (fifo_outs.front()) {
       // Emit the guarded writes on the last iteration inside the innermost
