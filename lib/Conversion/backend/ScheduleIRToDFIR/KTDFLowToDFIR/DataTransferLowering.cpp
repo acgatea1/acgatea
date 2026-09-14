@@ -395,20 +395,29 @@ struct LowerIndDataTransferPattern
       dir_dst_map = dir_src_map;
     }
 
-    // Indirect access map: 1-dim identity (IAB index → IAB element).
-    auto ind_map = mlir::AffineMap::getMultiDimIdentityMap(1, ctx);
-
-    // Indirect memref values and their single index operands.
+    // Indirect memref values, their index operands, and access maps.
+    // Use the map stored on the op if present; fall back to an identity map
+    // whose rank matches the IAB memref.
     mlir::Value ind_src_memref;
     mlir::Value ind_dst_memref;
     mlir::Value ind_src_index;
     mlir::Value ind_dst_index;
+    mlir::AffineMap ind_src_map;
+    mlir::AffineMap ind_dst_map;
     if (is_gather) {
       ind_src_memref = op.getIndSrcMemref();
       ind_src_index = op.getIndSrcIndex();
+      const auto ind_src_rank =
+          mlir::cast<mlir::MemRefType>(ind_src_memref.getType()).getRank();
+      ind_src_map = op.getIndSrcMap().value_or(
+          mlir::AffineMap::getMultiDimIdentityMap(ind_src_rank, ctx));
     } else {
       ind_dst_memref = op.getIndDstMemref();
       ind_dst_index = op.getIndDstIndex();
+      const auto ind_dst_rank =
+          mlir::cast<mlir::MemRefType>(ind_dst_memref.getType()).getRank();
+      ind_dst_map = op.getIndDstMap().value_or(
+          mlir::AffineMap::getMultiDimIdentityMap(ind_dst_rank, ctx));
     }
 
     // Operands list (per builder contract):
@@ -472,10 +481,10 @@ struct LowerIndDataTransferPattern
         /*direct_dst_memref=*/dir_dst_memref,
         /*dbgName=*/nullptr,
         /*indirect_src_map=*/
-        is_gather ? ind_map : mlir::AffineMap::get(0, 0, {}, ctx),
+        is_gather ? ind_src_map : mlir::AffineMap::get(0, 0, {}, ctx),
         /*direct_src_map=*/dir_src_map,
         /*indirect_dst_map=*/
-        is_scatter ? ind_map : mlir::AffineMap::get(0, 0, {}, ctx),
+        is_scatter ? ind_dst_map : mlir::AffineMap::get(0, 0, {}, ctx),
         /*direct_dst_map=*/dir_dst_map,
         /*operands=*/operands,
         /*type=*/load_iv_type,
