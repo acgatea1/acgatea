@@ -73,25 +73,25 @@ module {
   // a [1, 64] tile is loaded and written into a local staging buffer.
   // -------------------------------------------------------------------
   func.func @ind_transfer_gather_to_memref() attributes {grid = [2]} {
-    %l1lu0 = dataflow.get_unit {core = 0 : i32, name = "C0-L1LU", type = "L1LU"} : index
-    %l1lu1 = dataflow.get_unit {core = 1 : i32, name = "C1-L1LU", type = "L1LU"} : index
+    %mnilu0 = dataflow.get_unit {core = 0 : i32, name = "C0-MNILU", type = "MNILU"} : index
+    %mnilu1 = dataflow.get_unit {core = 1 : i32, name = "C1-MNILU", type = "MNILU"} : index
     %tile_id = ktdp.get_compute_tile_id : index
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %map_l1lu = uniform.def_immutable_mapping([%c0 -> %l1lu0], [%c1 -> %l1lu1]) : index
-    %u_l1lu   = uniform.query_map(map:%map_l1lu, key:%tile_id) : index
+    %map_mnilu = uniform.def_immutable_mapping([%c0 -> %mnilu0], [%c1 -> %mnilu1]) : index
+    %u_mnilu   = uniform.query_map(map:%map_mnilu, key:%tile_id) : index
 
-    ktdf_lowering.execute_on %u_l1lu {
-      %iab     = memref.alloc() : memref<32xindex, "L1">
-      %data    = memref.alloc() : memref<64x64xf16, "L1">
+    ktdf_lowering.execute_on %u_mnilu {
+      %iab     = memref.alloc() : memref<32xindex, "IAB">
+      %data    = memref.alloc() : memref<64x64xf16, "DDR">
       %staging = memref.alloc() : memref<1x64xf16, "L1">
       ktdf.ind_data_transfer
           ind_src = %iab[%c1]
           dir_src = %data[%c0, %c0] size [1, 64]
           ind_dst = none
           dir_dst = %staging[%c0, %c0] size [1, 64]
-          : memref<32xindex, "L1">,
-            memref<64x64xf16, "L1">,
+          : memref<32xindex, "IAB">,
+            memref<64x64xf16, "DDR">,
             none,
             memref<1x64xf16, "L1">
     }
@@ -101,37 +101,37 @@ module {
   // -------------------------------------------------------------------
   // Gather to FIFO: IAB entry drives the source base address; the loaded
   // vector is forwarded to the SFU via dataflow.send in the body.
-  // The outer execute_on spans both L1LU and SFU so the FIFO endpoint
+  // The outer execute_on spans both MNILU and SFU so the FIFO endpoint
   // ("SFU") can be resolved.
   // -------------------------------------------------------------------
   func.func @ind_transfer_gather_to_fifo() attributes {grid = [2]} {
-    %l1lu0 = dataflow.get_unit {core = 0 : i32, name = "C0-L1LU", type = "L1LU"} : index
-    %l1lu1 = dataflow.get_unit {core = 1 : i32, name = "C1-L1LU", type = "L1LU"} : index
+    %mnilu0 = dataflow.get_unit {core = 0 : i32, name = "C0-MNILU", type = "MNILU"} : index
+    %mnilu1 = dataflow.get_unit {core = 1 : i32, name = "C1-MNILU", type = "MNILU"} : index
     %sfu0  = dataflow.get_unit {core = 0 : i32, name = "C0-SFU",  type = "SFU"}  : index
     %sfu1  = dataflow.get_unit {core = 1 : i32, name = "C1-SFU",  type = "SFU"}  : index
     %tile_id = ktdp.get_compute_tile_id : index
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %map_l1lu = uniform.def_immutable_mapping([%c0 -> %l1lu0], [%c1 -> %l1lu1]) : index
-    %u_l1lu   = uniform.query_map(map:%map_l1lu, key:%tile_id) : index
+    %map_mnilu = uniform.def_immutable_mapping([%c0 -> %mnilu0], [%c1 -> %mnilu1]) : index
+    %u_mnilu   = uniform.query_map(map:%map_mnilu, key:%tile_id) : index
     %map_sfu  = uniform.def_immutable_mapping([%c0 -> %sfu0],  [%c1 -> %sfu1])  : index
     %u_sfu    = uniform.query_map(map:%map_sfu,  key:%tile_id) : index
 
-    %fifo = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
+    %fifo = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"MNILU" -> "SFU", 64xf16>
 
-    ktdf_lowering.execute_on %u_l1lu, %u_sfu {
-      ktdf_lowering.execute_on %u_l1lu {
-        %iab  = memref.alloc() : memref<32xindex, "L1">
-        %data = memref.alloc() : memref<64x64xf16, "L1">
+    ktdf_lowering.execute_on %u_mnilu, %u_sfu {
+      ktdf_lowering.execute_on %u_mnilu {
+        %iab  = memref.alloc() : memref<32xindex, "IAB">
+        %data = memref.alloc() : memref<64x64xf16, "DDR">
         ktdf.ind_data_transfer
             ind_src = %iab[%c1]
             dir_src = %data[%c0, %c0] size [1, 64]
             ind_dst = none
             dir_dst = %fifo           size [64]
-            : memref<32xindex, "L1">,
-              memref<64x64xf16, "L1">,
+            : memref<32xindex, "IAB">,
+              memref<64x64xf16, "DDR">,
               none,
-              !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
+              !ktdf.fifo.slot<"MNILU" -> "SFU", 64xf16>
       }
     }
     return
@@ -142,18 +142,18 @@ module {
   // tile is written from a local staging buffer to global memory.
   // -------------------------------------------------------------------
   func.func @ind_transfer_scatter() attributes {grid = [2]} {
-    %l1lu0 = dataflow.get_unit {core = 0 : i32, name = "C0-L1LU", type = "L1LU"} : index
-    %l1lu1 = dataflow.get_unit {core = 1 : i32, name = "C1-L1LU", type = "L1LU"} : index
+    %mnisu0 = dataflow.get_unit {core = 0 : i32, name = "C0-MNISU", type = "MNISU"} : index
+    %mnisu1 = dataflow.get_unit {core = 1 : i32, name = "C1-MNISU", type = "MNISU"} : index
     %tile_id = ktdp.get_compute_tile_id : index
     %c0 = arith.constant 0 : index
     %c1 = arith.constant 1 : index
-    %map_l1lu = uniform.def_immutable_mapping([%c0 -> %l1lu0], [%c1 -> %l1lu1]) : index
-    %u_l1lu   = uniform.query_map(map:%map_l1lu, key:%tile_id) : index
+    %map_mnisu = uniform.def_immutable_mapping([%c0 -> %mnisu0], [%c1 -> %mnisu1]) : index
+    %u_mnisu   = uniform.query_map(map:%map_mnisu, key:%tile_id) : index
 
-    ktdf_lowering.execute_on %u_l1lu {
-      %iab     = memref.alloc() : memref<32xindex, "L1">
+    ktdf_lowering.execute_on %u_mnisu {
+      %iab     = memref.alloc() : memref<32xindex, "IAB">
       %staging = memref.alloc() : memref<1x64xf16, "L1">
-      %dst     = memref.alloc() : memref<64x64xf16, "L1">
+      %dst     = memref.alloc() : memref<64x64xf16, "DDR">
       ktdf.ind_data_transfer
           ind_src = none
           dir_src = %staging[%c0, %c0] size [1, 64]
@@ -161,8 +161,8 @@ module {
           dir_dst = %dst[%c0, %c0]     size [1, 64]
           : none,
             memref<1x64xf16, "L1">,
-            memref<32xindex, "L1">,
-            memref<64x64xf16, "L1">
+            memref<32xindex, "IAB">,
+            memref<64x64xf16, "DDR">
     }
     return
   }
