@@ -469,19 +469,15 @@ struct LowerIndDataTransferPattern
         dst_is_fifo ? num_dir_src_indices
                     : static_cast<uint32_t>(dir_dst_indices.size());
 
+    // Resolve the enclosing program_unit (needed for self-sync and FIFO dest).
+    auto program_unit = op->getParentOfType<mlir::dataflow::ProgramUnitOp>();
+
     // Resolve the FIFO destination unit for gather-to-FIFO before creating
     // the composite op; the send is inserted into the body afterwards because
     // CompositeIndirectLoadAndStoreOp::build does not invoke the bodyBuilder
     // callback.
     mlir::Value fifo_dest_unit;
     if (dst_is_fifo) {
-      auto program_unit = op->getParentOfType<mlir::dataflow::ProgramUnitOp>();
-      if (!program_unit) {
-        op.emitError(
-            "ind_data_transfer gather-to-FIFO must be inside a "
-            "program_unit");
-        return mlir::failure();
-      }
       auto dst_fifo_slot_type =
           mlir::cast<mlir::ktdf::FifoSlotType>(dir_dst.getType());
       auto dest_unit_result = resolveUnitFromFifoAttr(
@@ -489,6 +485,36 @@ struct LowerIndDataTransferPattern
           loc, op.getOperation());
       if (mlir::failed(dest_unit_result)) return mlir::failure();
       fifo_dest_unit = *dest_unit_result;
+    }
+
+    // Emit a self-sync before the indirect transfer:
+    //   gather (MNILU): MNILU -> MNILU
+    //   scatter (MNISU): MNISU -> MNISU
+    //
+    // Placement: if the ind_data_transfer is inside a scf.for loop, place the
+    // sync_send immediately before that loop; otherwise place it right before
+    // the composite_indirect_load_and_store.
+    {
+      // Find the outermost enclosing scf::ForOp that is inside the
+      // program_unit but not in a deeper nesting of program_unit ops.
+      mlir::Operation* insertion_op = op.getOperation();
+      mlir::Operation* cursor = op->getParentOp();
+      while (cursor && !mlir::isa<mlir::dataflow::ProgramUnitOp>(cursor)) {
+        if (mlir::isa<mlir::scf::ForOp>(cursor)) insertion_op = cursor;
+        cursor = cursor->getParentOp();
+      }
+
+      llvm::SmallVector<mlir::Value, 4> self_units(
+          program_unit.getUnits().begin(), program_unit.getUnits().end());
+
+      mlir::OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPoint(insertion_op);
+      mlir::Value self_unit =
+          createQueryMapForComponent(rewriter, program_unit, self_units, loc);
+      mlir::dataflow::SyncSendOp::create(
+          rewriter, loc, self_unit,
+          /*dbgName=*/nullptr,
+          /*wait_immediately_for_async_transfers=*/rewriter.getBoolAttr(true));
     }
 
     auto composite_op = mlir::agen::CompositeIndirectLoadAndStoreOp::create(

@@ -18,6 +18,9 @@
 // CHECK-NEXT:       %[[ALLOC_0:.*]] = memref.alloc() : memref<32xindex, "IAB">
 // CHECK-NEXT:       %[[ALLOC_1:.*]] = memref.alloc() : memref<64x64xf16, "DDR">
 // CHECK-NEXT:       %[[ALLOC_2:.*]] = memref.alloc() : memref<1x64xf16, "L1">
+// CHECK-NEXT:       %[[DEF_IMMUTABLE_MAPPING_0:.*]] = uniform.def_immutable_mapping({{\[}}%[[GET_UNIT_0]] -> %[[GET_UNIT_0]]], {{\[}}%[[GET_UNIT_1]] -> %[[GET_UNIT_1]]]):index
+// CHECK-NEXT:       %[[QUERY_MAP_0:.*]] = uniform.query_map(map:%[[DEF_IMMUTABLE_MAPPING_0]], key:%[[VAL_0]]) : index
+// CHECK-NEXT:       dataflow.sync_send %[[QUERY_MAP_0]] {wait_immediately_for_async_transfers = true} : index
 // CHECK-NEXT:       agen.composite_indirect_load_and_store indirect_src:%[[ALLOC_0]]{{\[}}%[[CONSTANT_0]]] direct_src:%[[ALLOC_1]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]] direct_dst:%[[ALLOC_2]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]]
 // CHECK-NEXT:        time_symbols(), load_iv(%[[VAL_1:.*]]:vector<64xf16>)
 // CHECK-NEXT:        {load_direct_time_addr_map = #[[$ATTR_0]], load_indirect_time_addr_map = #[[$ATTR_1]], load_order = #[[$ATTR_2]], load_set = #[[$ATTR_5]], store_direct_time_addr_map = #[[$ATTR_0]], store_indirect_time_addr_map = #[[$ATTR_3]], store_order = #[[$ATTR_2]], store_set = #[[$ATTR_5]], time_order = #[[$ATTR_1]], time_set = #[[$ATTR_6]]}
@@ -40,6 +43,9 @@
 // CHECK-NEXT:       %[[ALLOC_1:.*]] = memref.alloc() : memref<64x64xf16, "DDR">
 // CHECK-NEXT:       %[[DEF_IMMUTABLE_MAPPING_0:.*]] = uniform.def_immutable_mapping({{\[}}%[[GET_UNIT_0]] -> %[[GET_UNIT_2]]], {{\[}}%[[GET_UNIT_1]] -> %[[GET_UNIT_3]]]):index
 // CHECK-NEXT:       %[[QUERY_MAP_0:.*]] = uniform.query_map(map:%[[DEF_IMMUTABLE_MAPPING_0]], key:%[[VAL_0]]) : index
+// CHECK-NEXT:       %[[DEF_IMMUTABLE_MAPPING_1:.*]] = uniform.def_immutable_mapping({{\[}}%[[GET_UNIT_0]] -> %[[GET_UNIT_0]]], {{\[}}%[[GET_UNIT_1]] -> %[[GET_UNIT_1]]]):index
+// CHECK-NEXT:       %[[QUERY_MAP_1:.*]] = uniform.query_map(map:%[[DEF_IMMUTABLE_MAPPING_1]], key:%[[VAL_0]]) : index
+// CHECK-NEXT:       dataflow.sync_send %[[QUERY_MAP_1]] {wait_immediately_for_async_transfers = true} : index
 // CHECK-NEXT:       agen.composite_indirect_load_and_store indirect_src:%[[ALLOC_0]]{{\[}}%[[CONSTANT_0]]] direct_src:%[[ALLOC_1]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]] direct_dst:%[[ALLOC_1]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]]
 // CHECK-NEXT:        time_symbols(), load_iv(%[[VAL_1:.*]]:vector<64xf16>)
 // CHECK-NEXT:        {load_direct_time_addr_map = #[[$ATTR_0]], load_indirect_time_addr_map = #[[$ATTR_1]], load_order = #[[$ATTR_2]], load_set = #[[$ATTR_5]], store_direct_time_addr_map = #[[$ATTR_4]], store_indirect_time_addr_map = #[[$ATTR_3]], store_order = #[[$ATTR_2]], store_set = #[[$ATTR_5]], time_order = #[[$ATTR_1]], time_set = #[[$ATTR_6]]}
@@ -62,6 +68,9 @@
 // CHECK-NEXT:       %[[ALLOC_0:.*]] = memref.alloc() : memref<32xindex, "IAB">
 // CHECK-NEXT:       %[[ALLOC_1:.*]] = memref.alloc() : memref<1x64xf16, "L1">
 // CHECK-NEXT:       %[[ALLOC_2:.*]] = memref.alloc() : memref<64x64xf16, "DDR">
+// CHECK-NEXT:       %[[DEF_IMMUTABLE_MAPPING_0:.*]] = uniform.def_immutable_mapping({{\[}}%[[GET_UNIT_0]] -> %[[GET_UNIT_0]]], {{\[}}%[[GET_UNIT_1]] -> %[[GET_UNIT_1]]]):index
+// CHECK-NEXT:       %[[QUERY_MAP_0:.*]] = uniform.query_map(map:%[[DEF_IMMUTABLE_MAPPING_0]], key:%[[VAL_0]]) : index
+// CHECK-NEXT:       dataflow.sync_send %[[QUERY_MAP_0]] {wait_immediately_for_async_transfers = true} : index
 // CHECK-NEXT:       agen.composite_indirect_load_and_store direct_src:%[[ALLOC_1]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]] indirect_dst:%[[ALLOC_0]]{{\[}}%[[CONSTANT_0]]] direct_dst:%[[ALLOC_2]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]]
 // CHECK-NEXT:        time_symbols(), load_iv(%[[VAL_1:.*]]:vector<64xf16>)
 // CHECK-NEXT:        {load_direct_time_addr_map = #[[$ATTR_0]], load_indirect_time_addr_map = #[[$ATTR_3]], load_order = #[[$ATTR_2]], load_set = #[[$ATTR_5]], store_direct_time_addr_map = #[[$ATTR_0]], store_indirect_time_addr_map = #[[$ATTR_1]], store_order = #[[$ATTR_2]], store_set = #[[$ATTR_5]], time_order = #[[$ATTR_1]], time_set = #[[$ATTR_6]]}
@@ -73,14 +82,19 @@
 // CHECK-NEXT:   }
 
 // CHECK-LABEL:   func.func @ind_transfer_gather_loop_iab_index() attributes {grid = [2]} {
-// CHECK-NEXT:     %[[CONSTANT_0:.*]] = arith.constant 0 : index
+// CHECK-NEXT:     %[[CONSTANT_0:.*]] = arith.constant 1 : index
+// CHECK-NEXT:     %[[CONSTANT_1:.*]] = arith.constant 32 : index
+// CHECK-NEXT:     %[[CONSTANT_2:.*]] = arith.constant 0 : index
 // CHECK-NEXT:     %[[GET_UNIT_0:.*]] = dataflow.get_unit {core = 0 : i32, name = "C0-MNILU", type = "MNILU"} : index
 // CHECK-NEXT:     dataflow.program_unit iter_arg : %[[VAL_0:.*]] -> (%[[GET_UNIT_0]]) : {
 // CHECK-NEXT:       %[[ALLOC_0:.*]] = memref.alloc() : memref<32xindex, "IAB">
 // CHECK-NEXT:       %[[ALLOC_1:.*]] = memref.alloc() : memref<64x64xf16, "DDR">
 // CHECK-NEXT:       %[[ALLOC_2:.*]] = memref.alloc() : memref<1x64xf16, "L1">
-// CHECK-NEXT:       affine.for %[[VAL_1:.*]] = 0 to 32 {
-// CHECK-NEXT:         agen.composite_indirect_load_and_store indirect_src:%[[ALLOC_0]]{{\[}}%[[VAL_1]]] direct_src:%[[ALLOC_1]]{{\[}}%[[CONSTANT_0]], %[[CONSTANT_0]]] direct_dst:%[[ALLOC_2]]{{\[}}%[[CONSTANT_0]], %[[CONSTANT_0]]]
+// CHECK-NEXT:       %[[DEF_IMMUTABLE_MAPPING_0:.*]] = uniform.def_immutable_mapping({{\[}}%[[GET_UNIT_0]] -> %[[GET_UNIT_0]]]):index
+// CHECK-NEXT:       %[[QUERY_MAP_0:.*]] = uniform.query_map(map:%[[DEF_IMMUTABLE_MAPPING_0]], key:%[[VAL_0]]) : index
+// CHECK-NEXT:       dataflow.sync_send %[[QUERY_MAP_0]] {wait_immediately_for_async_transfers = true} : index
+// CHECK-NEXT:       scf.for %[[VAL_1:.*]] = %[[CONSTANT_2]] to %[[CONSTANT_1]] step %[[CONSTANT_0]] {
+// CHECK-NEXT:         agen.composite_indirect_load_and_store indirect_src:%[[ALLOC_0]]{{\[}}%[[VAL_1]]] direct_src:%[[ALLOC_1]]{{\[}}%[[CONSTANT_2]], %[[CONSTANT_2]]] direct_dst:%[[ALLOC_2]]{{\[}}%[[CONSTANT_2]], %[[CONSTANT_2]]]
 // CHECK-NEXT:          time_symbols(), load_iv(%[[VAL_2:.*]]:vector<64xf16>)
 // CHECK-NEXT:          {load_direct_time_addr_map = #[[$ATTR_0]], load_indirect_time_addr_map = #[[$ATTR_1]], load_order = #[[$ATTR_2]], load_set = #[[$ATTR_5]], store_direct_time_addr_map = #[[$ATTR_0]], store_indirect_time_addr_map = #[[$ATTR_3]], store_order = #[[$ATTR_2]], store_set = #[[$ATTR_5]], time_order = #[[$ATTR_1]], time_set = #[[$ATTR_6]]}
 // CHECK-NEXT:         {
@@ -96,13 +110,16 @@
 // Verify that ktdf.ind_data_transfer is lowered to
 // agen.composite_indirect_load_and_store for all four modes:
 //   1. Gather → memref: IAB drives the source address; result goes into a
-//      local staging buffer.  No body beyond agen.yield.
+//      local staging buffer.  A self-sync (MNILU→MNILU) is emitted before the
+//      indirect op.  No body beyond agen.yield.
 //   2. Gather → FIFO: IAB drives the source address; result is forwarded
-//      via dataflow.send in the body.
+//      via dataflow.send in the body.  A self-sync is emitted before the
+//      indirect op.
 //   3. Scatter: IAB drives the destination address; source is a local buffer.
-//      No body beyond agen.yield.
-//   4. Gather → memref with a loop induction variable as the IAB index,
-//      verifying that dynamic index expressions are threaded through correctly.
+//      A self-sync (MNISU→MNISU) is emitted before the indirect op.  No body
+//      beyond agen.yield.
+//   4. Gather → memref with an scf.for induction variable as the IAB index:
+//      the self-sync is placed before the enclosing scf.for loop.
 //
 // In all cases the original ktdf.ind_data_transfer must not survive.
 
@@ -211,15 +228,16 @@ module {
 
   // -------------------------------------------------------------------
   // Gather to memref with loop iter arg as IAB index: the IAB entry
-  // index is supplied by an affine.for induction variable rather than
-  // a compile-time constant, verifying that dynamic index values are
-  // threaded through correctly.
+  // index is supplied by an scf.for induction variable rather than
+  // a compile-time constant, verifying that the self-sync is placed
+  // before the enclosing scf.for loop.
   // -------------------------------------------------------------------
   func.func @ind_transfer_gather_loop_iab_index() attributes {grid = [2]} {
     %mnilu0 = dataflow.get_unit {core = 0 : i32, name = "C0-MNILU", type = "MNILU"} : index
-    %mnilu1 = dataflow.get_unit {core = 1 : i32, name = "C1-MNILU", type = "MNILU"} : index
     %tile_id = ktdp.get_compute_tile_id : index
-    %c0 = arith.constant 0 : index
+    %c0  = arith.constant 0 : index
+    %c32 = arith.constant 32 : index
+    %c1  = arith.constant 1 : index
     %map_mnilu = uniform.def_immutable_mapping([%c0 -> %mnilu0]) : index
     %u_mnilu   = uniform.query_map(map:%map_mnilu, key:%tile_id) : index
 
@@ -227,7 +245,7 @@ module {
       %iab     = memref.alloc() : memref<32xindex, "IAB">
       %data    = memref.alloc() : memref<64x64xf16, "DDR">
       %staging = memref.alloc() : memref<1x64xf16, "L1">
-      affine.for %iv = 0 to 32 {
+      scf.for %iv = %c0 to %c32 step %c1 {
         ktdf.ind_data_transfer
             ind_src = %iab[%iv]
             dir_src = %data[%c0, %c0] size [1, 64]

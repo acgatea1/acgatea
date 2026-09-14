@@ -28,6 +28,9 @@
 // CHECK-NEXT:             agen.yield
 // CHECK-NEXT:           } : memref<32xindex, "DDR">, memref<32xindex, "IAB">
 // CHECK-NEXT:         }
+// CHECK-NEXT:         %[[DEF_IMMUTABLE_MAPPING_0:.*]] = uniform.def_immutable_mapping({{\[}}%[[GET_UNIT_0]] -> %[[GET_UNIT_0]]], {{\[}}%[[GET_UNIT_1]] -> %[[GET_UNIT_1]]]):index
+// CHECK-NEXT:         %[[QUERY_MAP_0:.*]] = uniform.query_map(map:%[[DEF_IMMUTABLE_MAPPING_0]], key:%[[VAL_0]]) : index
+// CHECK-NEXT:         dataflow.sync_send %[[QUERY_MAP_0]] {wait_immediately_for_async_transfers = true} : index
 // CHECK-NEXT:         agen.composite_indirect_load_and_store indirect_src:%[[ALLOC_1]]{{\[}}%[[VAL_1]]] direct_src:%[[ALLOC_2]]{{\[}}%[[CONSTANT_0]], %[[CONSTANT_0]]] direct_dst:%[[ALLOC_3]]{{\[}}%[[CONSTANT_0]], %[[CONSTANT_0]]]
 // CHECK-NEXT:          time_symbols(), load_iv(%[[VAL_3:.*]]:vector<64xf16>)
 // CHECK-NEXT:          {load_direct_time_addr_map = #[[$ATTR_1]], load_indirect_time_addr_map = #[[$ATTR_0]], load_order = #[[$ATTR_2]], load_set = #[[$ATTR_6]], store_direct_time_addr_map = #[[$ATTR_1]], store_indirect_time_addr_map = #[[$ATTR_3]], store_order = #[[$ATTR_2]], store_set = #[[$ATTR_6]], time_order = #[[$ATTR_0]], time_set = #[[$ATTR_4]]}
@@ -55,6 +58,9 @@
 // CHECK-NEXT:       {
 // CHECK-NEXT:         agen.yield
 // CHECK-NEXT:       } : memref<32xindex, "DDR">, memref<32xindex, "IAB">
+// CHECK-NEXT:       %[[DEF_IMMUTABLE_MAPPING_0:.*]] = uniform.def_immutable_mapping({{\[}}%[[GET_UNIT_0]] -> %[[GET_UNIT_0]]], {{\[}}%[[GET_UNIT_1]] -> %[[GET_UNIT_1]]]):index
+// CHECK-NEXT:       %[[QUERY_MAP_0:.*]] = uniform.query_map(map:%[[DEF_IMMUTABLE_MAPPING_0]], key:%[[VAL_0]]) : index
+// CHECK-NEXT:       dataflow.sync_send %[[QUERY_MAP_0]] {wait_immediately_for_async_transfers = true} : index
 // CHECK-NEXT:       agen.composite_indirect_load_and_store direct_src:%[[ALLOC_2]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]] indirect_dst:%[[ALLOC_1]]{{\[}}%[[CONSTANT_0]]] direct_dst:%[[ALLOC_3]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]]
 // CHECK-NEXT:        time_symbols(), load_iv(%[[VAL_1]]:vector<64xf16>)
 // CHECK-NEXT:        {load_direct_time_addr_map = #[[$ATTR_1]], load_indirect_time_addr_map = #[[$ATTR_3]], load_order = #[[$ATTR_2]], load_set = #[[$ATTR_6]], store_direct_time_addr_map = #[[$ATTR_1]], store_indirect_time_addr_map = #[[$ATTR_0]], store_order = #[[$ATTR_2]], store_set = #[[$ATTR_6]], time_order = #[[$ATTR_0]], time_set = #[[$ATTR_4]]}
@@ -83,6 +89,9 @@
 // CHECK-NEXT:       {
 // CHECK-NEXT:         agen.yield
 // CHECK-NEXT:       } : memref<32xindex, "DDR">, memref<32xindex, "IAB">
+// CHECK-NEXT:       %[[DEF_IMMUTABLE_MAPPING_0:.*]] = uniform.def_immutable_mapping({{\[}}%[[GET_UNIT_0]] -> %[[GET_UNIT_0]]], {{\[}}%[[GET_UNIT_1]] -> %[[GET_UNIT_1]]]):index
+// CHECK-NEXT:       %[[QUERY_MAP_0:.*]] = uniform.query_map(map:%[[DEF_IMMUTABLE_MAPPING_0]], key:%[[VAL_0]]) : index
+// CHECK-NEXT:       dataflow.sync_send %[[QUERY_MAP_0]] {wait_immediately_for_async_transfers = true} : index
 // CHECK-NEXT:       agen.composite_indirect_load_and_store indirect_src:%[[ALLOC_1]]{{\[}}%[[CONSTANT_0]]] direct_src:%[[ALLOC_2]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]] direct_dst:%[[ALLOC_3]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]]
 // CHECK-NEXT:        time_symbols(), load_iv(%[[VAL_1]]:vector<64xf16>)
 // CHECK-NEXT:        {load_direct_time_addr_map = #[[$ATTR_1]], load_indirect_time_addr_map = #[[$ATTR_0]], load_order = #[[$ATTR_2]], load_set = #[[$ATTR_6]], store_direct_time_addr_map = #[[$ATTR_1]], store_indirect_time_addr_map = #[[$ATTR_3]], store_order = #[[$ATTR_2]], store_set = #[[$ATTR_6]], time_order = #[[$ATTR_0]], time_set = #[[$ATTR_4]]}
@@ -101,6 +110,9 @@
 // CHECK-NEXT:       {
 // CHECK-NEXT:         agen.yield
 // CHECK-NEXT:       } : memref<32xindex, "DDR">, memref<32xindex, "IAB">
+// CHECK-NEXT:       %[[DEF_IMMUTABLE_MAPPING_1:.*]] = uniform.def_immutable_mapping({{\[}}%[[GET_UNIT_2]] -> %[[GET_UNIT_2]]], {{\[}}%[[GET_UNIT_3]] -> %[[GET_UNIT_3]]]):index
+// CHECK-NEXT:       %[[QUERY_MAP_1:.*]] = uniform.query_map(map:%[[DEF_IMMUTABLE_MAPPING_1]], key:%[[VAL_2]]) : index
+// CHECK-NEXT:       dataflow.sync_send %[[QUERY_MAP_1]] {wait_immediately_for_async_transfers = true} : index
 // CHECK-NEXT:       agen.composite_indirect_load_and_store direct_src:%[[ALLOC_6]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]] indirect_dst:%[[ALLOC_5]]{{\[}}%[[CONSTANT_0]]] direct_dst:%[[ALLOC_7]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]]
 // CHECK-NEXT:        time_symbols(), load_iv(%[[VAL_3]]:vector<64xf16>)
 // CHECK-NEXT:        {load_direct_time_addr_map = #[[$ATTR_1]], load_indirect_time_addr_map = #[[$ATTR_3]], load_order = #[[$ATTR_2]], load_set = #[[$ATTR_6]], store_direct_time_addr_map = #[[$ATTR_1]], store_indirect_time_addr_map = #[[$ATTR_0]], store_order = #[[$ATTR_2]], store_set = #[[$ATTR_6]], time_order = #[[$ATTR_0]], time_set = #[[$ATTR_4]]}
@@ -115,23 +127,23 @@
 
 // Verify that when an IAB fill (ktdf.data_transfer DDR→IAB) and an indirect
 // load (ktdf.ind_data_transfer) coexist in the same execute_on body, both are
-// lowered correctly and no ktdf ops survive:
+// lowered correctly and no ktdf ops survive.  A self-sync is emitted after
+// the IAB fill and before the composite_indirect_load_and_store:
 //
 //   1. gather_with_iab_fill: the IAB is first populated from DDR via a
 //      conditional data_transfer (only on the first loop iteration), then used
-//      as the indirect source for a gather to a local staging buffer.  Verifies
-//      that the fill produces agen.composite_load_and_store with index element
-//      type and that the subsequent indirect transfer produces
-//      agen.composite_indirect_load_and_store.
+//      as the indirect source for a gather to a local staging buffer.  The
+//      self-sync (MNILU→MNILU) is placed inside the loop, after the fill and
+//      before the indirect op.
 //
 //   2. scatter_with_iab_fill: same pattern on the scatter side — the IAB is
-//      filled first and then used as the indirect destination.
+//      filled first, then a self-sync (MNISU→MNISU) is emitted, then the
+//      indirect scatter.
 //
 //   3. iab_fill_gather_and_scatter: a single function contains an IAB fill,
-//      an indirect gather (MNILU), and an indirect scatter (MNISU).  Both
-//      indirect load and indirect store are present in the same function,
-//      verifying that the two agen.composite_indirect_load_and_store ops are
-//      emitted correctly when the fill, gather, and scatter coexist.
+//      an indirect gather (MNILU), and an indirect scatter (MNISU).  Each
+//      program_unit emits its own self-sync after its IAB fill and before its
+//      composite_indirect_load_and_store.
 
 module {
   ktdf_arch.device @sample_device attributes {} import("../../../../Dialect/KTDFArch/sample_device.mlir")
