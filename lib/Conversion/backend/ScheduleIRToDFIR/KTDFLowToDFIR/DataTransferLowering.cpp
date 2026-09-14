@@ -351,12 +351,30 @@ struct LowerIndDataTransferPattern
     auto load_direct_time_addr_map =
         mlir::AffineMap::get(num_time_dims, 0, src_time_dims.offsets(ctx), ctx);
 
-    // The IAB index is pinned (does not advance over time): constant zero map.
-    auto zero_1d_map =
-        mlir::AffineMap::get(num_time_dims, 0,
-                             llvm::SmallVector<mlir::AffineExpr>{
-                                 mlir::getAffineConstantExpr(0, ctx)},
-                             ctx);
+    // Indirect time addr map: the IAB is indexed one entry per time step
+    // (each entry is one address, so the step size is 1). Computed the same
+    // way as the direct maps: describeTransferTimeDims on the IAB shape with
+    // lanes=1.
+    auto empty_map = mlir::AffineMap::get(0, 0, {}, ctx);
+    mlir::AffineMap load_indirect_time_addr_map = empty_map;
+    mlir::AffineMap store_indirect_time_addr_map = empty_map;
+    if (is_gather) {
+      auto iab_memref_type =
+          mlir::cast<mlir::MemRefType>(op.getIndSrcMemref().getType());
+      llvm::SmallVector<int64_t> iab_sizes(iab_memref_type.getShape());
+      TransferTimeDims iab_time_dims =
+          describeTransferTimeDims(iab_sizes, /*lanes=*/1);
+      load_indirect_time_addr_map = mlir::AffineMap::get(
+          num_time_dims, 0, iab_time_dims.offsets(ctx), ctx);
+    } else {
+      auto iab_memref_type =
+          mlir::cast<mlir::MemRefType>(op.getIndDstMemref().getType());
+      llvm::SmallVector<int64_t> iab_sizes(iab_memref_type.getShape());
+      TransferTimeDims iab_time_dims =
+          describeTransferTimeDims(iab_sizes, /*lanes=*/1);
+      store_indirect_time_addr_map = mlir::AffineMap::get(
+          num_time_dims, 0, iab_time_dims.offsets(ctx), ctx);
+    }
 
     mlir::AffineMap store_direct_time_addr_map;
     if (!dst_is_fifo) {
@@ -494,11 +512,9 @@ struct LowerIndDataTransferPattern
         /*store_order=*/store_order,
         /*time_set=*/time_set,
         /*time_order=*/time_order,
-        /*load_indirect_time_addr_map=*/
-        is_gather ? zero_1d_map : mlir::AffineMap::get(0, 0, {}, ctx),
+        /*load_indirect_time_addr_map=*/load_indirect_time_addr_map,
         /*load_direct_time_addr_map=*/load_direct_time_addr_map,
-        /*store_indirect_time_addr_map=*/
-        is_scatter ? zero_1d_map : mlir::AffineMap::get(0, 0, {}, ctx),
+        /*store_indirect_time_addr_map=*/store_indirect_time_addr_map,
         /*store_direct_time_addr_map=*/store_direct_time_addr_map,
         /*num_ind_src_memref_indices=*/num_ind_src_indices,
         /*num_dir_src_memref_indices=*/num_dir_src_indices,
