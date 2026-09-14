@@ -1,22 +1,24 @@
 // RUN: dataflow-scheduler-opt -pass-pipeline="builtin.module(ktdflowering-to-dfir)" %s | FileCheck %s
 
 // Verify that ktdf.ind_data_transfer is lowered to
-// agen.composite_indirect_load_and_store for all three modes:
+// agen.composite_indirect_load_and_store for all four modes:
 //   1. Gather → memref: IAB drives the source address; result goes into a
 //      local staging buffer.  No body beyond agen.yield.
 //   2. Gather → FIFO: IAB drives the source address; result is forwarded
 //      via dataflow.send in the body.
 //   3. Scatter: IAB drives the destination address; source is a local buffer.
 //      No body beyond agen.yield.
+//   4. Gather → memref with a loop induction variable as the IAB index,
+//      verifying that dynamic index expressions are threaded through correctly.
 //
 // In all cases the original ktdf.ind_data_transfer must not survive.
 
-// CHECK: #[[$ZERO_2D:.+]] = affine_map<(d0) -> (0, 0)>
-// CHECK: #[[$ZERO_1D:.+]] = affine_map<(d0) -> (0)>
-// CHECK: #[[$ID_2D:.+]]   = affine_map<(d0, d1) -> (d0, d1)>
-// CHECK: #[[$EMPTY:.+]]   = affine_map<() -> ()>
-// CHECK: #[[$ID_1D:.+]]   = affine_map<(d0) -> (d0)>
-// CHECK: #[[$VEC_SET:.+]] = affine_set<(d0, d1) : (d0 == 0, d1 >= 0, -d1 + 63 >= 0)>
+// CHECK: #[[$ZERO_2D:.+]]  = affine_map<(d0) -> (0, 0)>
+// CHECK: #[[$ID_1D:.+]]    = affine_map<(d0) -> (d0)>
+// CHECK: #[[$ID_2D:.+]]    = affine_map<(d0, d1) -> (d0, d1)>
+// CHECK: #[[$EMPTY:.+]]    = affine_map<() -> ()>
+// CHECK: #[[$ZERO_1D:.+]]  = affine_map<(d0) -> (0)>
+// CHECK: #[[$VEC_SET:.+]]  = affine_set<(d0, d1) : (d0 == 0, d1 >= 0, -d1 + 63 >= 0)>
 // CHECK: #[[$TIME_SET:.+]] = affine_set<(d0) : (d0 == 0)>
 
 // ---------------------------------------------------------------------------
@@ -28,7 +30,7 @@
 // CHECK:           agen.composite_indirect_load_and_store
 // CHECK-SAME:        indirect_src:{{.+}} direct_src:{{.+}} direct_dst:{{.+}}
 // CHECK-NEXT:        time_symbols(), load_iv({{.+}}:vector<64xf16>)
-// CHECK-NEXT:        {load_direct_time_addr_map = #[[$ZERO_2D]], load_indirect_time_addr_map = #[[$ZERO_1D]], load_order = #[[$ID_2D]], load_set = #[[$VEC_SET]], store_direct_time_addr_map = #[[$ZERO_2D]], store_indirect_time_addr_map = #[[$EMPTY]], store_order = #[[$ID_2D]], store_set = #[[$VEC_SET]], time_order = #[[$ID_1D]], time_set = #[[$TIME_SET]]}
+// CHECK-NEXT:        {load_direct_time_addr_map = #[[$ZERO_2D]], load_indirect_time_addr_map = #[[$ID_1D]], load_order = #[[$ID_2D]], load_set = #[[$VEC_SET]], store_direct_time_addr_map = #[[$ZERO_2D]], store_indirect_time_addr_map = #[[$EMPTY]], store_order = #[[$ID_2D]], store_set = #[[$VEC_SET]], time_order = #[[$ID_1D]], time_set = #[[$TIME_SET]]}
 // CHECK-NEXT:      {
 // CHECK-NEXT:        agen.yield
 // CHECK-NEXT:      }
@@ -43,7 +45,7 @@
 // CHECK:           agen.composite_indirect_load_and_store
 // CHECK-SAME:        indirect_src:{{.+}} direct_src:{{.+}} direct_dst:{{.+}}
 // CHECK-NEXT:        time_symbols(), load_iv([[IV:%[a-z0-9_]+]]:vector<64xf16>)
-// CHECK-NEXT:        {load_direct_time_addr_map = #[[$ZERO_2D]], load_indirect_time_addr_map = #[[$ZERO_1D]], load_order = #[[$ID_2D]], load_set = #[[$VEC_SET]], store_direct_time_addr_map = #[[$ZERO_1D]], store_indirect_time_addr_map = #[[$EMPTY]], store_order = #[[$ID_2D]], store_set = #[[$VEC_SET]], time_order = #[[$ID_1D]], time_set = #[[$TIME_SET]]}
+// CHECK-NEXT:        {load_direct_time_addr_map = #[[$ZERO_2D]], load_indirect_time_addr_map = #[[$ID_1D]], load_order = #[[$ID_2D]], load_set = #[[$VEC_SET]], store_direct_time_addr_map = #[[$ZERO_1D]], store_indirect_time_addr_map = #[[$EMPTY]], store_order = #[[$ID_2D]], store_set = #[[$VEC_SET]], time_order = #[[$ID_1D]], time_set = #[[$TIME_SET]]}
 // CHECK-NEXT:      {
 // CHECK-NEXT:        dataflow.send %{{.+}}, [[IV]] : vector<64xf16>
 // CHECK-NEXT:        agen.yield
@@ -59,7 +61,7 @@
 // CHECK:           agen.composite_indirect_load_and_store
 // CHECK-SAME:        direct_src:{{.+}} indirect_dst:{{.+}} direct_dst:{{.+}}
 // CHECK-NEXT:        time_symbols(), load_iv({{.+}}:vector<64xf16>)
-// CHECK-NEXT:        {load_direct_time_addr_map = #[[$ZERO_2D]], load_indirect_time_addr_map = #[[$EMPTY]], load_order = #[[$ID_2D]], load_set = #[[$VEC_SET]], store_direct_time_addr_map = #[[$ZERO_2D]], store_indirect_time_addr_map = #[[$ZERO_1D]], store_order = #[[$ID_2D]], store_set = #[[$VEC_SET]], time_order = #[[$ID_1D]], time_set = #[[$TIME_SET]]}
+// CHECK-NEXT:        {load_direct_time_addr_map = #[[$ZERO_2D]], load_indirect_time_addr_map = #[[$EMPTY]], load_order = #[[$ID_2D]], load_set = #[[$VEC_SET]], store_direct_time_addr_map = #[[$ZERO_2D]], store_indirect_time_addr_map = #[[$ID_1D]], store_order = #[[$ID_2D]], store_set = #[[$VEC_SET]], time_order = #[[$ID_1D]], time_set = #[[$TIME_SET]]}
 // CHECK-NEXT:      {
 // CHECK-NEXT:        agen.yield
 // CHECK-NEXT:      }
@@ -74,7 +76,7 @@
 // CHECK:           agen.composite_indirect_load_and_store
 // CHECK-SAME:        indirect_src:{{.+}} direct_src:{{.+}} direct_dst:{{.+}}
 // CHECK-NEXT:        time_symbols(), load_iv({{.+}}:vector<64xf16>)
-// CHECK-NEXT:        {load_direct_time_addr_map = #[[$ZERO_2D]], load_indirect_time_addr_map = #[[$ZERO_1D]], load_order = #[[$ID_2D]], load_set = #[[$VEC_SET]], store_direct_time_addr_map = #[[$ZERO_2D]], store_indirect_time_addr_map = #[[$EMPTY]], store_order = #[[$ID_2D]], store_set = #[[$VEC_SET]], time_order = #[[$ID_1D]], time_set = #[[$TIME_SET]]}
+// CHECK-NEXT:        {load_direct_time_addr_map = #[[$ZERO_2D]], load_indirect_time_addr_map = #[[$ID_1D]], load_order = #[[$ID_2D]], load_set = #[[$VEC_SET]], store_direct_time_addr_map = #[[$ZERO_2D]], store_indirect_time_addr_map = #[[$EMPTY]], store_order = #[[$ID_2D]], store_set = #[[$VEC_SET]], time_order = #[[$ID_1D]], time_set = #[[$TIME_SET]]}
 // CHECK-NEXT:      {
 // CHECK-NEXT:        agen.yield
 // CHECK-NEXT:      }
