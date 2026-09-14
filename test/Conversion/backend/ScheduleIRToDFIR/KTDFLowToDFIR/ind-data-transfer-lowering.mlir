@@ -65,6 +65,21 @@
 // CHECK-NEXT:      }
 // CHECK-NOT:       ktdf.ind_data_transfer
 
+// ---------------------------------------------------------------------------
+// Test 4: gather → memref with loop iter arg as IAB index
+// ---------------------------------------------------------------------------
+
+// CHECK-LABEL: func.func @ind_transfer_gather_loop_iab_index
+// CHECK:         dataflow.program_unit
+// CHECK:           agen.composite_indirect_load_and_store
+// CHECK-SAME:        indirect_src:{{.+}} direct_src:{{.+}} direct_dst:{{.+}}
+// CHECK-NEXT:        time_symbols(), load_iv({{.+}}:vector<64xf16>)
+// CHECK-NEXT:        {load_direct_time_addr_map = #[[$ZERO_2D]], load_indirect_time_addr_map = #[[$ZERO_1D]], load_order = #[[$ID_2D]], load_set = #[[$VEC_SET]], store_direct_time_addr_map = #[[$ZERO_2D]], store_indirect_time_addr_map = #[[$EMPTY]], store_order = #[[$ID_2D]], store_set = #[[$VEC_SET]], time_order = #[[$ID_1D]], time_set = #[[$TIME_SET]]}
+// CHECK-NEXT:      {
+// CHECK-NEXT:        agen.yield
+// CHECK-NEXT:      }
+// CHECK-NOT:       ktdf.ind_data_transfer
+
 module {
   ktdf_arch.device @sample_device attributes {} import("../../../../Dialect/KTDFArch/sample_device.mlir")
 
@@ -163,6 +178,39 @@ module {
             memref<1x64xf16, "L1">,
             memref<32xindex, "IAB">,
             memref<64x64xf16, "DDR">
+    }
+    return
+  }
+
+  // -------------------------------------------------------------------
+  // Gather to memref with loop iter arg as IAB index: the IAB entry
+  // index is supplied by an affine.for induction variable rather than
+  // a compile-time constant, verifying that dynamic index values are
+  // threaded through correctly.
+  // -------------------------------------------------------------------
+  func.func @ind_transfer_gather_loop_iab_index() attributes {grid = [2]} {
+    %mnilu0 = dataflow.get_unit {core = 0 : i32, name = "C0-MNILU", type = "MNILU"} : index
+    %mnilu1 = dataflow.get_unit {core = 1 : i32, name = "C1-MNILU", type = "MNILU"} : index
+    %tile_id = ktdp.get_compute_tile_id : index
+    %c0 = arith.constant 0 : index
+    %map_mnilu = uniform.def_immutable_mapping([%c0 -> %mnilu0]) : index
+    %u_mnilu   = uniform.query_map(map:%map_mnilu, key:%tile_id) : index
+
+    ktdf_lowering.execute_on %u_mnilu {
+      %iab     = memref.alloc() : memref<32xindex, "IAB">
+      %data    = memref.alloc() : memref<64x64xf16, "DDR">
+      %staging = memref.alloc() : memref<1x64xf16, "L1">
+      affine.for %iv = 0 to 32 {
+        ktdf.ind_data_transfer
+            ind_src = %iab[%iv]
+            dir_src = %data[%c0, %c0] size [1, 64]
+            ind_dst = none
+            dir_dst = %staging[%c0, %c0] size [1, 64]
+            : memref<32xindex, "IAB">,
+              memref<64x64xf16, "DDR">,
+              none,
+              memref<1x64xf16, "L1">
+      }
     }
     return
   }
