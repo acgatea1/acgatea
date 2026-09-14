@@ -242,7 +242,7 @@ mlir::AffineMap foldStepIntoSubscripts(mlir::MLIRContext* context,
 /// agen.composite_indirect_load_and_store.
 ///
 /// Scatter mode (ind_dst present, ind_src absent):
-///   dir_src is a memref in L1; dir_dst is a memref in global memory.
+///   dir_src is a local memref; dir_dst is a memref in global memory.
 ///   The IAB entry at ind_dst_index drives the destination base address.
 ///   The body is empty (just agen.yield).
 ///
@@ -254,7 +254,7 @@ struct LowerIndDataTransferPattern
     : public mlir::OpRewritePattern<mlir::ktdf::IndDataTransferOp> {
   LowerIndDataTransferPattern(mlir::MLIRContext* context,
                               const ResourceToUnits& components,
-                              arch_view::ResourceKinds& resource_kinds)
+                              mlir::ktdf_arch::ResourceKinds& resource_kinds)
       : OpRewritePattern(context),
         components_(components),
         resource_kinds_(resource_kinds) {}
@@ -303,20 +303,20 @@ struct LowerIndDataTransferPattern
 
     auto elem_type = dir_src_memref_type.getElementType();
 
-    const auto lanes = getVectorLanes(elem_type, resource_kinds_);
-    if (!lanes) {
-      op.emitError(
+    auto compute = resource_kinds_.getDefaultCompute();
+    if (!compute) {
+      return op.emitError(
           "ind_data_transfer lowering: cannot determine hardware vector "
-          "width; architecture declares no compute resource kind");
-      return mlir::failure();
+          "width; architecture declares no default compute resource");
     }
+    const auto lanes = getVectorLanes(elem_type, compute);
 
     const int64_t total_src = [&] {
       int64_t t = 1;
       for (int64_t s : src_sizes) t *= s;
       return t;
     }();
-    const int64_t iv_lanes = std::min(total_src, *lanes);
+    const int64_t iv_lanes = std::min(total_src, lanes);
     auto load_iv_type = mlir::VectorType::get({iv_lanes}, elem_type);
 
     // load_set / load_order: per-vector footprint on the dir_src side.
@@ -339,8 +339,7 @@ struct LowerIndDataTransferPattern
         mlir::AffineMap::getMultiDimIdentityMap(store_sizes.size(), ctx);
 
     // Time set / order / addr maps.
-    TransferTimeDims src_time_dims =
-        describeTransferTimeDims(src_sizes, *lanes);
+    TransferTimeDims src_time_dims = describeTransferTimeDims(src_sizes, lanes);
     llvm::SmallVector<int64_t> time_extents = src_time_dims.extents;
     if (time_extents.empty()) time_extents.push_back(1);
     const unsigned num_time_dims = time_extents.size();
@@ -362,7 +361,7 @@ struct LowerIndDataTransferPattern
     mlir::AffineMap store_direct_time_addr_map;
     if (!dst_is_fifo) {
       TransferTimeDims dst_time_dims =
-          describeTransferTimeDims(dst_sizes, *lanes);
+          describeTransferTimeDims(dst_sizes, lanes);
       store_direct_time_addr_map = mlir::AffineMap::get(
           num_time_dims, 0, dst_time_dims.offsets(ctx), ctx);
     } else {
@@ -473,10 +472,10 @@ struct LowerIndDataTransferPattern
         /*direct_dst_memref=*/dir_dst_memref,
         /*dbgName=*/nullptr,
         /*indirect_src_map=*/
-            is_gather ? ind_map : mlir::AffineMap::get(0, 0, {}, ctx),
+        is_gather ? ind_map : mlir::AffineMap::get(0, 0, {}, ctx),
         /*direct_src_map=*/dir_src_map,
         /*indirect_dst_map=*/
-            is_scatter ? ind_map : mlir::AffineMap::get(0, 0, {}, ctx),
+        is_scatter ? ind_map : mlir::AffineMap::get(0, 0, {}, ctx),
         /*direct_dst_map=*/dir_dst_map,
         /*operands=*/operands,
         /*type=*/load_iv_type,
@@ -518,7 +517,7 @@ struct LowerIndDataTransferPattern
 
  private:
   const ResourceToUnits& components_;
-  arch_view::ResourceKinds& resource_kinds_;
+  mlir::ktdf_arch::ResourceKinds& resource_kinds_;
 };
 
 /// Pattern to lower ktdf.data_transfer operations
