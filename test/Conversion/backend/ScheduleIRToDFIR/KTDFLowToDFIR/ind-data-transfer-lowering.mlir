@@ -1,5 +1,98 @@
 // RUN: dataflow-scheduler-opt -pass-pipeline="builtin.module(ktdflowering-to-dfir)" %s | FileCheck %s
 
+// CHECK: #[[$ATTR_0:.+]] = affine_map<(d0) -> (0, 0)>
+// CHECK: #[[$ATTR_1:.+]] = affine_map<(d0) -> (d0)>
+// CHECK: #[[$ATTR_2:.+]] = affine_map<(d0, d1) -> (d0, d1)>
+// CHECK: #[[$ATTR_3:.+]] = affine_map<() -> ()>
+// CHECK: #[[$ATTR_4:.+]] = affine_map<(d0) -> (0)>
+// CHECK: #[[$ATTR_5:.+]] = affine_set<(d0, d1) : (d0 == 0, d1 >= 0, -d1 + 63 >= 0)>
+// CHECK: #[[$ATTR_6:.+]] = affine_set<(d0) : (d0 == 0)>
+// CHECK-LABEL:   ktdf_arch.device @sample_device import("../../../../Dialect/KTDFArch/sample_device.mlir")
+
+// CHECK-LABEL:   func.func @ind_transfer_gather_to_memref() attributes {grid = [2]} {
+// CHECK-NEXT:     %[[CONSTANT_0:.*]] = arith.constant 1 : index
+// CHECK-NEXT:     %[[CONSTANT_1:.*]] = arith.constant 0 : index
+// CHECK-NEXT:     %[[GET_UNIT_0:.*]] = dataflow.get_unit {core = 0 : i32, name = "C0-MNILU", type = "MNILU"} : index
+// CHECK-NEXT:     %[[GET_UNIT_1:.*]] = dataflow.get_unit {core = 1 : i32, name = "C1-MNILU", type = "MNILU"} : index
+// CHECK-NEXT:     dataflow.program_unit iter_arg : %[[VAL_0:.*]] -> (%[[GET_UNIT_0]], %[[GET_UNIT_1]]) : {
+// CHECK-NEXT:       %[[ALLOC_0:.*]] = memref.alloc() : memref<32xindex, "IAB">
+// CHECK-NEXT:       %[[ALLOC_1:.*]] = memref.alloc() : memref<64x64xf16, "DDR">
+// CHECK-NEXT:       %[[ALLOC_2:.*]] = memref.alloc() : memref<1x64xf16, "L1">
+// CHECK-NEXT:       agen.composite_indirect_load_and_store indirect_src:%[[ALLOC_0]]{{\[}}%[[CONSTANT_0]]] direct_src:%[[ALLOC_1]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]] direct_dst:%[[ALLOC_2]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]]
+// CHECK-NEXT:        time_symbols(), load_iv(%[[VAL_1:.*]]:vector<64xf16>)
+// CHECK-NEXT:        {load_direct_time_addr_map = #[[$ATTR_0]], load_indirect_time_addr_map = #[[$ATTR_1]], load_order = #[[$ATTR_2]], load_set = #[[$ATTR_5]], store_direct_time_addr_map = #[[$ATTR_0]], store_indirect_time_addr_map = #[[$ATTR_3]], store_order = #[[$ATTR_2]], store_set = #[[$ATTR_5]], time_order = #[[$ATTR_1]], time_set = #[[$ATTR_6]]}
+// CHECK-NEXT:       {
+// CHECK-NEXT:         agen.yield
+// CHECK-NEXT:       } : memref<32xindex, "IAB">, memref<64x64xf16, "DDR">, memref<1x64xf16, "L1">
+// CHECK-NEXT:     }
+// CHECK-NEXT:     return
+// CHECK-NEXT:   }
+
+// CHECK-LABEL:   func.func @ind_transfer_gather_to_fifo() attributes {grid = [2]} {
+// CHECK-NEXT:     %[[CONSTANT_0:.*]] = arith.constant 1 : index
+// CHECK-NEXT:     %[[CONSTANT_1:.*]] = arith.constant 0 : index
+// CHECK-NEXT:     %[[GET_UNIT_0:.*]] = dataflow.get_unit {core = 0 : i32, name = "C0-MNILU", type = "MNILU"} : index
+// CHECK-NEXT:     %[[GET_UNIT_1:.*]] = dataflow.get_unit {core = 1 : i32, name = "C1-MNILU", type = "MNILU"} : index
+// CHECK-NEXT:     %[[GET_UNIT_2:.*]] = dataflow.get_unit {core = 0 : i32, name = "C0-SFU", type = "SFU"} : index
+// CHECK-NEXT:     %[[GET_UNIT_3:.*]] = dataflow.get_unit {core = 1 : i32, name = "C1-SFU", type = "SFU"} : index
+// CHECK-NEXT:     dataflow.program_unit iter_arg : %[[VAL_0:.*]] -> (%[[GET_UNIT_0]], %[[GET_UNIT_1]]) : {
+// CHECK-NEXT:       %[[ALLOC_0:.*]] = memref.alloc() : memref<32xindex, "IAB">
+// CHECK-NEXT:       %[[ALLOC_1:.*]] = memref.alloc() : memref<64x64xf16, "DDR">
+// CHECK-NEXT:       %[[DEF_IMMUTABLE_MAPPING_0:.*]] = uniform.def_immutable_mapping({{\[}}%[[GET_UNIT_0]] -> %[[GET_UNIT_2]]], {{\[}}%[[GET_UNIT_1]] -> %[[GET_UNIT_3]]]):index
+// CHECK-NEXT:       %[[QUERY_MAP_0:.*]] = uniform.query_map(map:%[[DEF_IMMUTABLE_MAPPING_0]], key:%[[VAL_0]]) : index
+// CHECK-NEXT:       agen.composite_indirect_load_and_store indirect_src:%[[ALLOC_0]]{{\[}}%[[CONSTANT_0]]] direct_src:%[[ALLOC_1]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]] direct_dst:%[[ALLOC_1]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]]
+// CHECK-NEXT:        time_symbols(), load_iv(%[[VAL_1:.*]]:vector<64xf16>)
+// CHECK-NEXT:        {load_direct_time_addr_map = #[[$ATTR_0]], load_indirect_time_addr_map = #[[$ATTR_1]], load_order = #[[$ATTR_2]], load_set = #[[$ATTR_5]], store_direct_time_addr_map = #[[$ATTR_4]], store_indirect_time_addr_map = #[[$ATTR_3]], store_order = #[[$ATTR_2]], store_set = #[[$ATTR_5]], time_order = #[[$ATTR_1]], time_set = #[[$ATTR_6]]}
+// CHECK-NEXT:       {
+// CHECK-NEXT:         dataflow.send %[[QUERY_MAP_0]], %[[VAL_1]] : vector<64xf16>
+// CHECK-NEXT:         agen.yield
+// CHECK-NEXT:       } : memref<32xindex, "IAB">, memref<64x64xf16, "DDR">, memref<64x64xf16, "DDR">
+// CHECK-NEXT:     }
+// CHECK-NEXT:     dataflow.program_unit iter_arg : %[[VAL_2:.*]] -> (%[[GET_UNIT_2]], %[[GET_UNIT_3]]) : {
+// CHECK-NEXT:     }
+// CHECK-NEXT:     return
+// CHECK-NEXT:   }
+
+// CHECK-LABEL:   func.func @ind_transfer_scatter() attributes {grid = [2]} {
+// CHECK-NEXT:     %[[CONSTANT_0:.*]] = arith.constant 1 : index
+// CHECK-NEXT:     %[[CONSTANT_1:.*]] = arith.constant 0 : index
+// CHECK-NEXT:     %[[GET_UNIT_0:.*]] = dataflow.get_unit {core = 0 : i32, name = "C0-MNISU", type = "MNISU"} : index
+// CHECK-NEXT:     %[[GET_UNIT_1:.*]] = dataflow.get_unit {core = 1 : i32, name = "C1-MNISU", type = "MNISU"} : index
+// CHECK-NEXT:     dataflow.program_unit iter_arg : %[[VAL_0:.*]] -> (%[[GET_UNIT_0]], %[[GET_UNIT_1]]) : {
+// CHECK-NEXT:       %[[ALLOC_0:.*]] = memref.alloc() : memref<32xindex, "IAB">
+// CHECK-NEXT:       %[[ALLOC_1:.*]] = memref.alloc() : memref<1x64xf16, "L1">
+// CHECK-NEXT:       %[[ALLOC_2:.*]] = memref.alloc() : memref<64x64xf16, "DDR">
+// CHECK-NEXT:       agen.composite_indirect_load_and_store direct_src:%[[ALLOC_1]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]] indirect_dst:%[[ALLOC_0]]{{\[}}%[[CONSTANT_0]]] direct_dst:%[[ALLOC_2]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]]
+// CHECK-NEXT:        time_symbols(), load_iv(%[[VAL_1:.*]]:vector<64xf16>)
+// CHECK-NEXT:        {load_direct_time_addr_map = #[[$ATTR_0]], load_indirect_time_addr_map = #[[$ATTR_3]], load_order = #[[$ATTR_2]], load_set = #[[$ATTR_5]], store_direct_time_addr_map = #[[$ATTR_0]], store_indirect_time_addr_map = #[[$ATTR_1]], store_order = #[[$ATTR_2]], store_set = #[[$ATTR_5]], time_order = #[[$ATTR_1]], time_set = #[[$ATTR_6]]}
+// CHECK-NEXT:       {
+// CHECK-NEXT:         agen.yield
+// CHECK-NEXT:       } : memref<1x64xf16, "L1">, memref<32xindex, "IAB">, memref<64x64xf16, "DDR">
+// CHECK-NEXT:     }
+// CHECK-NEXT:     return
+// CHECK-NEXT:   }
+
+// CHECK-LABEL:   func.func @ind_transfer_gather_loop_iab_index() attributes {grid = [2]} {
+// CHECK-NEXT:     %[[CONSTANT_0:.*]] = arith.constant 0 : index
+// CHECK-NEXT:     %[[GET_UNIT_0:.*]] = dataflow.get_unit {core = 0 : i32, name = "C0-MNILU", type = "MNILU"} : index
+// CHECK-NEXT:     dataflow.program_unit iter_arg : %[[VAL_0:.*]] -> (%[[GET_UNIT_0]]) : {
+// CHECK-NEXT:       %[[ALLOC_0:.*]] = memref.alloc() : memref<32xindex, "IAB">
+// CHECK-NEXT:       %[[ALLOC_1:.*]] = memref.alloc() : memref<64x64xf16, "DDR">
+// CHECK-NEXT:       %[[ALLOC_2:.*]] = memref.alloc() : memref<1x64xf16, "L1">
+// CHECK-NEXT:       affine.for %[[VAL_1:.*]] = 0 to 32 {
+// CHECK-NEXT:         agen.composite_indirect_load_and_store indirect_src:%[[ALLOC_0]]{{\[}}%[[VAL_1]]] direct_src:%[[ALLOC_1]]{{\[}}%[[CONSTANT_0]], %[[CONSTANT_0]]] direct_dst:%[[ALLOC_2]]{{\[}}%[[CONSTANT_0]], %[[CONSTANT_0]]]
+// CHECK-NEXT:          time_symbols(), load_iv(%[[VAL_2:.*]]:vector<64xf16>)
+// CHECK-NEXT:          {load_direct_time_addr_map = #[[$ATTR_0]], load_indirect_time_addr_map = #[[$ATTR_1]], load_order = #[[$ATTR_2]], load_set = #[[$ATTR_5]], store_direct_time_addr_map = #[[$ATTR_0]], store_indirect_time_addr_map = #[[$ATTR_3]], store_order = #[[$ATTR_2]], store_set = #[[$ATTR_5]], time_order = #[[$ATTR_1]], time_set = #[[$ATTR_6]]}
+// CHECK-NEXT:         {
+// CHECK-NEXT:           agen.yield
+// CHECK-NEXT:         } : memref<32xindex, "IAB">, memref<64x64xf16, "DDR">, memref<1x64xf16, "L1">
+// CHECK-NEXT:       }
+// CHECK-NEXT:     }
+// CHECK-NEXT:     return
+// CHECK-NEXT:   }
+
+
+
 // Verify that ktdf.ind_data_transfer is lowered to
 // agen.composite_indirect_load_and_store for all four modes:
 //   1. Gather → memref: IAB drives the source address; result goes into a
@@ -13,74 +106,6 @@
 //
 // In all cases the original ktdf.ind_data_transfer must not survive.
 
-// CHECK: #[[$ZERO_2D:.+]]  = affine_map<(d0) -> (0, 0)>
-// CHECK: #[[$ID_1D:.+]]    = affine_map<(d0) -> (d0)>
-// CHECK: #[[$ID_2D:.+]]    = affine_map<(d0, d1) -> (d0, d1)>
-// CHECK: #[[$EMPTY:.+]]    = affine_map<() -> ()>
-// CHECK: #[[$ZERO_1D:.+]]  = affine_map<(d0) -> (0)>
-// CHECK: #[[$VEC_SET:.+]]  = affine_set<(d0, d1) : (d0 == 0, d1 >= 0, -d1 + 63 >= 0)>
-// CHECK: #[[$TIME_SET:.+]] = affine_set<(d0) : (d0 == 0)>
-
-// ---------------------------------------------------------------------------
-// Test 1: gather → memref
-// ---------------------------------------------------------------------------
-
-// CHECK-LABEL: func.func @ind_transfer_gather_to_memref
-// CHECK:         dataflow.program_unit
-// CHECK:           agen.composite_indirect_load_and_store
-// CHECK-SAME:        indirect_src:{{.+}} direct_src:{{.+}} direct_dst:{{.+}}
-// CHECK-NEXT:        time_symbols(), load_iv({{.+}}:vector<64xf16>)
-// CHECK-NEXT:        {load_direct_time_addr_map = #[[$ZERO_2D]], load_indirect_time_addr_map = #[[$ID_1D]], load_order = #[[$ID_2D]], load_set = #[[$VEC_SET]], store_direct_time_addr_map = #[[$ZERO_2D]], store_indirect_time_addr_map = #[[$EMPTY]], store_order = #[[$ID_2D]], store_set = #[[$VEC_SET]], time_order = #[[$ID_1D]], time_set = #[[$TIME_SET]]}
-// CHECK-NEXT:      {
-// CHECK-NEXT:        agen.yield
-// CHECK-NEXT:      }
-// CHECK-NOT:       ktdf.ind_data_transfer
-
-// ---------------------------------------------------------------------------
-// Test 2: gather → FIFO
-// ---------------------------------------------------------------------------
-
-// CHECK-LABEL: func.func @ind_transfer_gather_to_fifo
-// CHECK:         dataflow.program_unit
-// CHECK:           agen.composite_indirect_load_and_store
-// CHECK-SAME:        indirect_src:{{.+}} direct_src:{{.+}} direct_dst:{{.+}}
-// CHECK-NEXT:        time_symbols(), load_iv([[IV:%[a-z0-9_]+]]:vector<64xf16>)
-// CHECK-NEXT:        {load_direct_time_addr_map = #[[$ZERO_2D]], load_indirect_time_addr_map = #[[$ID_1D]], load_order = #[[$ID_2D]], load_set = #[[$VEC_SET]], store_direct_time_addr_map = #[[$ZERO_1D]], store_indirect_time_addr_map = #[[$EMPTY]], store_order = #[[$ID_2D]], store_set = #[[$VEC_SET]], time_order = #[[$ID_1D]], time_set = #[[$TIME_SET]]}
-// CHECK-NEXT:      {
-// CHECK-NEXT:        dataflow.send %{{.+}}, [[IV]] : vector<64xf16>
-// CHECK-NEXT:        agen.yield
-// CHECK-NEXT:      }
-// CHECK-NOT:       ktdf.ind_data_transfer
-
-// ---------------------------------------------------------------------------
-// Test 3: scatter
-// ---------------------------------------------------------------------------
-
-// CHECK-LABEL: func.func @ind_transfer_scatter
-// CHECK:         dataflow.program_unit
-// CHECK:           agen.composite_indirect_load_and_store
-// CHECK-SAME:        direct_src:{{.+}} indirect_dst:{{.+}} direct_dst:{{.+}}
-// CHECK-NEXT:        time_symbols(), load_iv({{.+}}:vector<64xf16>)
-// CHECK-NEXT:        {load_direct_time_addr_map = #[[$ZERO_2D]], load_indirect_time_addr_map = #[[$EMPTY]], load_order = #[[$ID_2D]], load_set = #[[$VEC_SET]], store_direct_time_addr_map = #[[$ZERO_2D]], store_indirect_time_addr_map = #[[$ID_1D]], store_order = #[[$ID_2D]], store_set = #[[$VEC_SET]], time_order = #[[$ID_1D]], time_set = #[[$TIME_SET]]}
-// CHECK-NEXT:      {
-// CHECK-NEXT:        agen.yield
-// CHECK-NEXT:      }
-// CHECK-NOT:       ktdf.ind_data_transfer
-
-// ---------------------------------------------------------------------------
-// Test 4: gather → memref with loop iter arg as IAB index
-// ---------------------------------------------------------------------------
-
-// CHECK-LABEL: func.func @ind_transfer_gather_loop_iab_index
-// CHECK:         dataflow.program_unit
-// CHECK:           agen.composite_indirect_load_and_store
-// CHECK-SAME:        indirect_src:{{.+}} direct_src:{{.+}} direct_dst:{{.+}}
-// CHECK-NEXT:        time_symbols(), load_iv({{.+}}:vector<64xf16>)
-// CHECK-NEXT:        {load_direct_time_addr_map = #[[$ZERO_2D]], load_indirect_time_addr_map = #[[$ID_1D]], load_order = #[[$ID_2D]], load_set = #[[$VEC_SET]], store_direct_time_addr_map = #[[$ZERO_2D]], store_indirect_time_addr_map = #[[$EMPTY]], store_order = #[[$ID_2D]], store_set = #[[$VEC_SET]], time_order = #[[$ID_1D]], time_set = #[[$TIME_SET]]}
-// CHECK-NEXT:      {
-// CHECK-NEXT:        agen.yield
-// CHECK-NEXT:      }
-// CHECK-NOT:       ktdf.ind_data_transfer
 
 module {
   ktdf_arch.device @sample_device attributes {} import("../../../../Dialect/KTDFArch/sample_device.mlir")
