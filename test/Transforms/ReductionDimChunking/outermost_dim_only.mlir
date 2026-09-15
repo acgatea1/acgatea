@@ -81,8 +81,8 @@
 // CHECK-NEXT:                     ktdf.data_transfer from %[[VAL_2]]#1{{\[}}%[[DIVSI_0]], %[[CONSTANT_6]]] size [1, 64] to %[[VAL_5]]#1 size [64] : memref<1x64xf16, "L1">, !ktdf.fifo.slot<"L1LU" -> "SFU", 64xf16>
 // CHECK-NEXT:                   }
 // CHECK-NEXT:                 } {applicable_units = ["L1LU"]}
-// CHECK-NEXT:                 ktdf.stage depends_in(%[[VAL_6:.*]]#3) depends_out(%[[VAL_6]]#4) {
-// CHECK-NEXT:                   %[[READ_FROM_FIFO_0:.*]] = ktdf.read_from_fifo %[[VAL_6]]#0 : <"L1LU" -> "SFU", 16384xf16> -> tensor<1x256x64xf16>
+// CHECK-NEXT:                 ktdf.stage depends_in(%[[VAL_5:.*]]#3) depends_out(%[[VAL_5]]#4) {
+// CHECK-NEXT:                   %[[READ_FROM_FIFO_0:.*]] = ktdf.read_from_fifo %[[VAL_5]]#0 : <"L1LU" -> "SFU", 16384xf16> -> tensor<1x256x64xf16>
 // CHECK-NEXT:                   %[[EMPTY_0:.*]] = tensor.empty() : tensor<64xf16>
 // CHECK-NEXT:                   %[[GENERIC_0:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_0]], #[[$ATTR_1]]], iterator_types = ["reduction", "reduction", "parallel"]} ins(%[[READ_FROM_FIFO_0]] : tensor<1x256x64xf16>) outs(%[[EMPTY_0]] : tensor<64xf16>) {
 // CHECK-NEXT:                   ^bb0(%[[VAL_7:.*]]: f16, %[[VAL_8:.*]]: f16):
@@ -92,7 +92,7 @@
 // CHECK-NEXT:                   %[[IF_0:.*]] = scf.if %[[CMPI_0]] -> (tensor<64xf16>) {
 // CHECK-NEXT:                     scf.yield %[[GENERIC_0]] : tensor<64xf16>
 // CHECK-NEXT:                   } else {
-// CHECK-NEXT:                     %[[READ_FROM_FIFO_1:.*]] = ktdf.read_from_fifo %[[VAL_6]]#1 : <"L1LU" -> "SFU", 64xf16> -> tensor<64xf16>
+// CHECK-NEXT:                     %[[READ_FROM_FIFO_1:.*]] = ktdf.read_from_fifo %[[VAL_5]]#1 : <"L1LU" -> "SFU", 64xf16> -> tensor<64xf16>
 // CHECK-NEXT:                     %[[GENERIC_1:.*]] = linalg.generic {indexing_maps = [#[[$ATTR_2]], #[[$ATTR_2]]], iterator_types = ["parallel"]} ins(%[[READ_FROM_FIFO_1]] : tensor<64xf16>) outs(%[[GENERIC_0]] : tensor<64xf16>) {
 // CHECK-NEXT:                     ^bb0(%[[VAL_9:.*]]: f16, %[[VAL_10:.*]]: f16):
 // CHECK-NEXT:                       %[[ADDF_1:.*]] = arith.addf %[[VAL_9]], %[[VAL_10]] : f16
@@ -100,7 +100,7 @@
 // CHECK-NEXT:                     } -> tensor<64xf16>
 // CHECK-NEXT:                     scf.yield %[[GENERIC_1]] : tensor<64xf16>
 // CHECK-NEXT:                   }
-// CHECK-NEXT:                   ktdf.write_to_fifo %[[IF_0]], %[[VAL_6]]#2 : tensor<64xf16>, <"SFU" -> "L1SU", 64xf16>
+// CHECK-NEXT:                   ktdf.write_to_fifo %[[IF_0]], %[[VAL_5]]#2 : tensor<64xf16>, <"SFU" -> "L1SU", 64xf16>
 // CHECK-NEXT:                 } {applicable_units = ["SFU"]}
 // CHECK-NEXT:                 ktdf.stage depends_in(%[[VAL_11:.*]]#4) depends_out(none) {
 // CHECK-NEXT:                   %[[CONSTANT_8:.*]] = arith.constant 0 : index
