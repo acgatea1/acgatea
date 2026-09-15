@@ -240,10 +240,9 @@ mlir::AffineMap foldStepIntoSubscripts(mlir::MLIRContext* context,
 }
 
 /// Emit a self-sync (dataflow.sync_send) before `indirect_transfer`, hoisted as
-/// far out of enclosing loops as possible without crossing a loop block also
-/// encloses the IAB fill (`fill_op`). E.g.
-/// scf.for {
-///   agen.composite_load_and_store ... <IBR fill>
+/// far out of enclosing loops as possible without crossing a loop block that
+/// also encloses the IAB fill (`fill_op`). E.g. scf.for {
+///   agen.composite_load_and_store ... <IBA fill>
 /// }
 /// <self-sync here>
 /// scf.for {
@@ -260,9 +259,7 @@ static void emitSelfSyncIndirect(
     mlir::dataflow::ProgramUnitOp program_unit,
     const ResourceToUnits& components) {
   mlir::Operation* insertion_op = indirect_transfer.getOperation();
-  // Blocks of ops that enclose fill_op; a loop in this set is a common
-  // ancestor — stop hoisting there.  Empty when fill_op is null (no
-  // constraint).
+  // If there is a fill_op, collect the set of blocks of ops enclosing fill_op.
   llvm::DenseSet<mlir::Block*> fill_ancestor_blocks;
   if (fill_op) {
     for (mlir::Operation* p = fill_op->getParentOp(); p; p = p->getParentOp())
@@ -272,6 +269,8 @@ static void emitSelfSyncIndirect(
   mlir::Operation* cursor = indirect_transfer->getParentOp();
   while (cursor && !mlir::isa<mlir::dataflow::ProgramUnitOp>(cursor)) {
     if (mlir::isa<mlir::scf::ForOp, mlir::affine::AffineForOp>(cursor)) {
+      // cursor is a common ancestor of op and fill_op so should not hoist
+      // the self-sync outside of cursor.
       if (fill_ancestor_blocks.count(cursor->getBlock())) break;
       insertion_op = cursor;
     }
