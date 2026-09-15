@@ -241,30 +241,30 @@ mlir::AffineMap foldStepIntoSubscripts(mlir::MLIRContext* context,
 
 /// Emit a self-sync (dataflow.sync_send) before `indirect_transfer`, hoisted as
 /// far out of enclosing loops as possible without crossing a loop block that
-/// also encloses the IAB fill (`fill_op`). E.g. scf.for {
-///   agen.composite_load_and_store ... <IBA fill>
+/// also encloses the IAB fill (`fill_op`). E.g.
+/// scf.for {
+///   agen.composite_load_and_store ... <IAB fill>
 /// }
 /// <self-sync here>
 /// scf.for {
 ///   agen.composite_load_and_store ... <Indirect load/store>
 /// }
 ///
-/// If `fill_op` is nullptr there is no fill constraint and the sync is hoisted
-/// to before the outermost enclosing loop.  Otherwise the fill's ancestor
-/// blocks are collected once (O(depth)) and used as an O(1) membership test
-/// while walking up from `indirect_transfer` to find the hoist boundary.
+/// `fill_op` must be non-null; callers must only call this when a fill exists.
+/// The fill's ancestor blocks are collected once (O(depth)) and used as an
+/// O(1) membership test while walking up from `indirect_transfer` to find the
+/// hoist boundary.
 static void emitSelfSyncIndirect(
     mlir::PatternRewriter& rewriter, mlir::Location loc,
     mlir::ktdf::IndDataTransferOp indirect_transfer, mlir::Operation* fill_op,
     mlir::dataflow::ProgramUnitOp program_unit,
     const ResourceToUnits& components) {
+  assert(fill_op && "emitSelfSyncIndirect requires a non-null fill_op");
   mlir::Operation* insertion_op = indirect_transfer.getOperation();
-  // If there is a fill_op, collect the set of blocks of ops enclosing fill_op.
+  // Collect the set of blocks enclosing fill_op to find the hoist boundary.
   llvm::DenseSet<mlir::Block*> fill_ancestor_blocks;
-  if (fill_op) {
-    for (mlir::Operation* p = fill_op->getParentOp(); p; p = p->getParentOp())
-      fill_ancestor_blocks.insert(p->getBlock());
-  }
+  for (mlir::Operation* p = fill_op->getParentOp(); p; p = p->getParentOp())
+    fill_ancestor_blocks.insert(p->getBlock());
 
   mlir::Operation* cursor = indirect_transfer->getParentOp();
   while (cursor && !mlir::isa<mlir::dataflow::ProgramUnitOp>(cursor)) {
@@ -538,9 +538,10 @@ struct LowerIndDataTransferPattern
       fifo_dest_unit = *dest_unit_result;
     }
 
-    // Emit a self-sync before the indirect transfer, hoisted as far out of
-    // enclosing loops as possible without crossing a loop that also encloses
-    // the IAB fill.
+    // Emit a self-sync before the indirect transfer only when there is a
+    // DataTransferOp filling the IAB at runtime. The sync is hoisted as far
+    // out of enclosing loops as possible without crossing the fill. If the IAB
+    // has no fill op, no sync is needed.
     {
       mlir::Value iab_memref =
           is_gather ? op.getIndSrcMemref() : op.getIndDstMemref();
@@ -551,8 +552,9 @@ struct LowerIndDataTransferPattern
           break;
         }
       }
-      emitSelfSyncIndirect(rewriter, loc, op, fill_op, program_unit,
-                           components_);
+      if (fill_op)
+        emitSelfSyncIndirect(rewriter, loc, op, fill_op, program_unit,
+                             components_);
     }
 
     auto composite_op = mlir::agen::CompositeIndirectLoadAndStoreOp::create(

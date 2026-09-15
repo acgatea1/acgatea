@@ -203,9 +203,9 @@
 //      (MNILU->MNILU) is hoisted to before the loop because the IAB fill and
 //      the ind_data_transfer are in different blocks.
 //
-// DDR buffers arrive as ktdp.construct_memory_view chains (outside execute_on)
-// and are lowered to dataflow.get_logical_memory_view inside the program_unit.
-// IAB buffers use ktdp_lowering.construct_memory_view and pass through unchanged.
+// DDR and IAB buffers are lowered to dataflow.get_logical_memory_view inside
+// the program_unit (DDR via ktdp.construct_memory_view chains outside
+// execute_on; IAB via ktdp_lowering.construct_memory_view inside execute_on).
 // L1 buffers remain as memref.alloc.
 
 #ddr_coord_1d = affine_set<(d0) : (d0 >= 0, -d0 + 31 >= 0)>

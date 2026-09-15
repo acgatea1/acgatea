@@ -24,9 +24,6 @@
 // CHECK-NEXT:       %[[GET_LOGICAL_MEMORY_VIEW_0:.*]] = dataflow.get_logical_memory_view %[[GET_UNIT_2]], %[[CONSTANT_1]] {layout_map = #[[$ATTR_0]]} : index, index, memref<64x64xf16>
 // CHECK-NEXT:       %[[GET_LOGICAL_MEMORY_VIEW_1:.*]] = dataflow.get_logical_memory_view %[[QUERY_MAP_0]], %[[CONSTANT_1]] {layout_map = #[[$ATTR_1]]} : index, index, memref<32xindex>
 // CHECK-NEXT:       %[[ALLOC_0:.*]] = memref.alloc() : memref<1x64xf16, "L1">
-// CHECK-NEXT:       %[[DEF_IMMUTABLE_MAPPING_1:.*]] = uniform.def_immutable_mapping({{\[}}%[[GET_UNIT_0]] -> %[[GET_UNIT_0]]], {{\[}}%[[GET_UNIT_1]] -> %[[GET_UNIT_1]]]):index
-// CHECK-NEXT:       %[[QUERY_MAP_1:.*]] = uniform.query_map(map:%[[DEF_IMMUTABLE_MAPPING_1]], key:%[[VAL_0]]) : index
-// CHECK-NEXT:       dataflow.sync_send %[[QUERY_MAP_1]] {wait_immediately_for_async_transfers = true} : index
 // CHECK-NEXT:       agen.composite_indirect_load_and_store indirect_src:%[[GET_LOGICAL_MEMORY_VIEW_1]]{{\[}}%[[CONSTANT_0]]] direct_src:%[[GET_LOGICAL_MEMORY_VIEW_0]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]] direct_dst:%[[ALLOC_0]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]]
 // CHECK-NEXT:        time_symbols(), load_iv(%[[VAL_1:.*]]:vector<64xf16>)
 // CHECK-NEXT:        {load_direct_time_addr_map = #[[$ATTR_2]], load_indirect_time_addr_map = #[[$ATTR_1]], load_order = #[[$ATTR_3]], load_set = #[[$ATTR_6]], store_direct_time_addr_map = #[[$ATTR_2]], store_indirect_time_addr_map = #[[$ATTR_4]], store_order = #[[$ATTR_3]], store_set = #[[$ATTR_6]], time_order = #[[$ATTR_1]], time_set = #[[$ATTR_7]]}
@@ -54,9 +51,6 @@
 // CHECK-NEXT:       %[[GET_LOGICAL_MEMORY_VIEW_1:.*]] = dataflow.get_logical_memory_view %[[QUERY_MAP_0]], %[[CONSTANT_1]] {layout_map = #[[$ATTR_1]]} : index, index, memref<32xindex>
 // CHECK-NEXT:       %[[DEF_IMMUTABLE_MAPPING_1:.*]] = uniform.def_immutable_mapping({{\[}}%[[GET_UNIT_0]] -> %[[GET_UNIT_2]]], {{\[}}%[[GET_UNIT_1]] -> %[[GET_UNIT_3]]]):index
 // CHECK-NEXT:       %[[QUERY_MAP_1:.*]] = uniform.query_map(map:%[[DEF_IMMUTABLE_MAPPING_1]], key:%[[VAL_0]]) : index
-// CHECK-NEXT:       %[[DEF_IMMUTABLE_MAPPING_2:.*]] = uniform.def_immutable_mapping({{\[}}%[[GET_UNIT_0]] -> %[[GET_UNIT_0]]], {{\[}}%[[GET_UNIT_1]] -> %[[GET_UNIT_1]]]):index
-// CHECK-NEXT:       %[[QUERY_MAP_2:.*]] = uniform.query_map(map:%[[DEF_IMMUTABLE_MAPPING_2]], key:%[[VAL_0]]) : index
-// CHECK-NEXT:       dataflow.sync_send %[[QUERY_MAP_2]] {wait_immediately_for_async_transfers = true} : index
 // CHECK-NEXT:       agen.composite_indirect_load_and_store indirect_src:%[[GET_LOGICAL_MEMORY_VIEW_1]]{{\[}}%[[CONSTANT_0]]] direct_src:%[[GET_LOGICAL_MEMORY_VIEW_0]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]] direct_dst:%[[GET_LOGICAL_MEMORY_VIEW_0]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]]
 // CHECK-NEXT:        time_symbols(), load_iv(%[[VAL_1:.*]]:vector<64xf16>)
 // CHECK-NEXT:        {load_direct_time_addr_map = #[[$ATTR_2]], load_indirect_time_addr_map = #[[$ATTR_1]], load_order = #[[$ATTR_3]], load_set = #[[$ATTR_6]], store_direct_time_addr_map = #[[$ATTR_5]], store_indirect_time_addr_map = #[[$ATTR_4]], store_order = #[[$ATTR_3]], store_set = #[[$ATTR_6]], time_order = #[[$ATTR_1]], time_set = #[[$ATTR_7]]}
@@ -84,9 +78,6 @@
 // CHECK-NEXT:       %[[GET_LOGICAL_MEMORY_VIEW_0:.*]] = dataflow.get_logical_memory_view %[[GET_UNIT_2]], %[[CONSTANT_1]] {layout_map = #[[$ATTR_0]]} : index, index, memref<64x64xf16>
 // CHECK-NEXT:       %[[GET_LOGICAL_MEMORY_VIEW_1:.*]] = dataflow.get_logical_memory_view %[[QUERY_MAP_0]], %[[CONSTANT_1]] {layout_map = #[[$ATTR_1]]} : index, index, memref<32xindex>
 // CHECK-NEXT:       %[[ALLOC_0:.*]] = memref.alloc() : memref<1x64xf16, "L1">
-// CHECK-NEXT:       %[[DEF_IMMUTABLE_MAPPING_1:.*]] = uniform.def_immutable_mapping({{\[}}%[[GET_UNIT_0]] -> %[[GET_UNIT_0]]], {{\[}}%[[GET_UNIT_1]] -> %[[GET_UNIT_1]]]):index
-// CHECK-NEXT:       %[[QUERY_MAP_1:.*]] = uniform.query_map(map:%[[DEF_IMMUTABLE_MAPPING_1]], key:%[[VAL_0]]) : index
-// CHECK-NEXT:       dataflow.sync_send %[[QUERY_MAP_1]] {wait_immediately_for_async_transfers = true} : index
 // CHECK-NEXT:       agen.composite_indirect_load_and_store direct_src:%[[ALLOC_0]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]] indirect_dst:%[[GET_LOGICAL_MEMORY_VIEW_1]]{{\[}}%[[CONSTANT_0]]] direct_dst:%[[GET_LOGICAL_MEMORY_VIEW_0]]{{\[}}%[[CONSTANT_1]], %[[CONSTANT_1]]]
 // CHECK-NEXT:        time_symbols(), load_iv(%[[VAL_1:.*]]:vector<64xf16>)
 // CHECK-NEXT:        {load_direct_time_addr_map = #[[$ATTR_2]], load_indirect_time_addr_map = #[[$ATTR_4]], load_order = #[[$ATTR_3]], load_set = #[[$ATTR_6]], store_direct_time_addr_map = #[[$ATTR_2]], store_indirect_time_addr_map = #[[$ATTR_1]], store_order = #[[$ATTR_3]], store_set = #[[$ATTR_6]], time_order = #[[$ATTR_1]], time_set = #[[$ATTR_7]]}
@@ -110,9 +101,6 @@
 // CHECK-NEXT:       %[[GET_LOGICAL_MEMORY_VIEW_0:.*]] = dataflow.get_logical_memory_view %[[GET_UNIT_1]], %[[CONSTANT_2]] {layout_map = #[[$ATTR_0]]} : index, index, memref<64x64xf16>
 // CHECK-NEXT:       %[[GET_LOGICAL_MEMORY_VIEW_1:.*]] = dataflow.get_logical_memory_view %[[QUERY_MAP_0]], %[[CONSTANT_2]] {layout_map = #[[$ATTR_1]]} : index, index, memref<32xindex>
 // CHECK-NEXT:       %[[ALLOC_0:.*]] = memref.alloc() : memref<1x64xf16, "L1">
-// CHECK-NEXT:       %[[DEF_IMMUTABLE_MAPPING_1:.*]] = uniform.def_immutable_mapping({{\[}}%[[GET_UNIT_0]] -> %[[GET_UNIT_0]]]):index
-// CHECK-NEXT:       %[[QUERY_MAP_1:.*]] = uniform.query_map(map:%[[DEF_IMMUTABLE_MAPPING_1]], key:%[[VAL_0]]) : index
-// CHECK-NEXT:       dataflow.sync_send %[[QUERY_MAP_1]] {wait_immediately_for_async_transfers = true} : index
 // CHECK-NEXT:       scf.for %[[VAL_1:.*]] = %[[CONSTANT_2]] to %[[CONSTANT_1]] step %[[CONSTANT_0]] {
 // CHECK-NEXT:         agen.composite_indirect_load_and_store indirect_src:%[[GET_LOGICAL_MEMORY_VIEW_1]]{{\[}}%[[VAL_1]]] direct_src:%[[GET_LOGICAL_MEMORY_VIEW_0]]{{\[}}%[[CONSTANT_2]], %[[CONSTANT_2]]] direct_dst:%[[ALLOC_0]]{{\[}}%[[CONSTANT_2]], %[[CONSTANT_2]]]
 // CHECK-NEXT:          time_symbols(), load_iv(%[[VAL_2:.*]]:vector<64xf16>)
