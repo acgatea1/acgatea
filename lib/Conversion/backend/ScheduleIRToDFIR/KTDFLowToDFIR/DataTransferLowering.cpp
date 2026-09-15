@@ -28,6 +28,7 @@
 #include "mlir/Analysis/Presburger/IntegerRelation.h"
 #include "mlir/Analysis/Presburger/PresburgerSpace.h"
 #include "mlir/Dialect/Affine/Analysis/AffineStructures.h"
+#include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IntegerSet.h"
@@ -236,6 +237,57 @@ mlir::AffineMap foldStepIntoSubscripts(mlir::MLIRContext* context,
           mlir::getAffineDimExpr(map.getNumDims(), context);
   return mlir::AffineMap::get(map.getNumDims() + 1, map.getNumSymbols(),
                               results, context);
+}
+
+/// Emit a self-sync (dataflow.sync_send) before `indirect_transfer`, hoisted as
+/// far out of enclosing loops as possible without crossing a loop block also
+/// encloses the IAB fill (`fill_op`). E.g.
+/// scf.for {
+///   agen.composite_load_and_store ... <IBR fill>
+/// }
+/// <self-sync here>
+/// scf.for {
+///   agen.composite_load_and_store ... <Indirect load/store>
+/// }
+///
+/// If `fill_op` is nullptr there is no fill constraint and the sync is hoisted
+/// to before the outermost enclosing loop.  Otherwise the fill's ancestor
+/// blocks are collected once (O(depth)) and used as an O(1) membership test
+/// while walking up from `indirect_transfer` to find the hoist boundary.
+static void emitSelfSyncIndirect(
+    mlir::PatternRewriter& rewriter, mlir::Location loc,
+    mlir::ktdf::IndDataTransferOp indirect_transfer, mlir::Operation* fill_op,
+    mlir::dataflow::ProgramUnitOp program_unit,
+    const ResourceToUnits& components) {
+  mlir::Operation* insertion_op = indirect_transfer.getOperation();
+  // Blocks of ops that enclose fill_op; a loop in this set is a common
+  // ancestor — stop hoisting there.  Empty when fill_op is null (no
+  // constraint).
+  llvm::DenseSet<mlir::Block*> fill_ancestor_blocks;
+  if (fill_op) {
+    for (mlir::Operation* p = fill_op->getParentOp(); p; p = p->getParentOp())
+      fill_ancestor_blocks.insert(p->getBlock());
+  }
+
+  mlir::Operation* cursor = indirect_transfer->getParentOp();
+  while (cursor && !mlir::isa<mlir::dataflow::ProgramUnitOp>(cursor)) {
+    if (mlir::isa<mlir::scf::ForOp, mlir::affine::AffineForOp>(cursor)) {
+      if (fill_ancestor_blocks.count(cursor->getBlock())) break;
+      insertion_op = cursor;
+    }
+    cursor = cursor->getParentOp();
+  }
+
+  llvm::SmallVector<mlir::Value, 4> self_units(program_unit.getUnits().begin(),
+                                               program_unit.getUnits().end());
+  mlir::OpBuilder::InsertionGuard guard(rewriter);
+  rewriter.setInsertionPoint(insertion_op);
+  mlir::Value self_unit =
+      createQueryMapForComponent(rewriter, program_unit, self_units, loc);
+  mlir::dataflow::SyncSendOp::create(
+      rewriter, loc, self_unit,
+      /*dbgName=*/nullptr,
+      /*wait_immediately_for_async_transfers=*/rewriter.getBoolAttr(true));
 }
 
 /// Pattern to lower ktdf.ind_data_transfer to
@@ -487,34 +539,21 @@ struct LowerIndDataTransferPattern
       fifo_dest_unit = *dest_unit_result;
     }
 
-    // Emit a self-sync before the indirect transfer:
-    //   gather (MNILU): MNILU -> MNILU
-    //   scatter (MNISU): MNISU -> MNISU
-    //
-    // Placement: if the ind_data_transfer is inside a scf.for loop, place the
-    // sync_send immediately before that loop; otherwise place it right before
-    // the composite_indirect_load_and_store.
+    // Emit a self-sync before the indirect transfer, hoisted as far out of
+    // enclosing loops as possible without crossing a loop that also encloses
+    // the IAB fill.
     {
-      // Find the outermost enclosing scf::ForOp that is inside the
-      // program_unit but not in a deeper nesting of program_unit ops.
-      mlir::Operation* insertion_op = op.getOperation();
-      mlir::Operation* cursor = op->getParentOp();
-      while (cursor && !mlir::isa<mlir::dataflow::ProgramUnitOp>(cursor)) {
-        if (mlir::isa<mlir::scf::ForOp>(cursor)) insertion_op = cursor;
-        cursor = cursor->getParentOp();
+      mlir::Value iab_memref =
+          is_gather ? op.getIndSrcMemref() : op.getIndDstMemref();
+      mlir::Operation* fill_op = nullptr;
+      for (mlir::Operation* user : iab_memref.getUsers()) {
+        if (mlir::isa<mlir::ktdf::DataTransferOp>(user)) {
+          fill_op = user;
+          break;
+        }
       }
-
-      llvm::SmallVector<mlir::Value, 4> self_units(
-          program_unit.getUnits().begin(), program_unit.getUnits().end());
-
-      mlir::OpBuilder::InsertionGuard guard(rewriter);
-      rewriter.setInsertionPoint(insertion_op);
-      mlir::Value self_unit =
-          createQueryMapForComponent(rewriter, program_unit, self_units, loc);
-      mlir::dataflow::SyncSendOp::create(
-          rewriter, loc, self_unit,
-          /*dbgName=*/nullptr,
-          /*wait_immediately_for_async_transfers=*/rewriter.getBoolAttr(true));
+      emitSelfSyncIndirect(rewriter, loc, op, fill_op, program_unit,
+                           components_);
     }
 
     auto composite_op = mlir::agen::CompositeIndirectLoadAndStoreOp::create(
