@@ -539,17 +539,19 @@ struct LowerIndDataTransferPattern
     }
 
     // Emit a self-sync before the indirect transfer only when there is a
-    // DataTransferOp filling the IAB at runtime. The sync is hoisted as far
-    // out of enclosing loops as possible without crossing the fill. If the IAB
-    // has no fill op, no sync is needed.
+    // DataTransferOp whose destination is the IAB.
+    // The sync is hoisted as far out of enclosing loops as possible without
+    // crossing the fill. If the IAB has no fill, no sync is needed.
     {
       mlir::Value iab_memref =
           is_gather ? op.getIndSrcMemref() : op.getIndDstMemref();
       mlir::Operation* fill_op = nullptr;
       for (mlir::Operation* user : iab_memref.getUsers()) {
-        if (mlir::isa<mlir::ktdf::DataTransferOp>(user)) {
-          fill_op = user;
-          break;
+        if (auto dt = mlir::dyn_cast<mlir::ktdf::DataTransferOp>(user)) {
+          if (dt.getDestination() == iab_memref) {
+            fill_op = user;
+            break;
+          }
         }
       }
       if (fill_op)
