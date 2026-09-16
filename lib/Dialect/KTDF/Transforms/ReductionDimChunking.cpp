@@ -20,9 +20,12 @@
 // into sequential chunks so that each chunk fits in the hardware FIFO path.
 //
 // When the chunk count is inferred from the threshold (--num-chunks not given),
-// only the outermost reduction dimension is chunked.
-// If that dimension is also the inner dim (the rightmost input tensor
-// dimension, belonging to the hardware SIMD path), chunking is skipped.
+// chunking uses a GCD-based outer-to-inner strategy: starting from the
+// outermost reduction dimension, each step absorbs gcd(dim_size, remaining)
+// into that dimension and passes remaining/gcd inward.  Dimensions with a
+// symbolic (dynamic) size are skipped.  The innermost overall loop dimension
+// is never chunked — if it is a reduction dim it is excluded before
+// distribution begins.
 //
 // When --num-chunks is given explicitly, multi-dim chunking is applied using
 // one value per reduction dimension (in iterator-type order); one nested
@@ -203,46 +206,34 @@ struct ReductionDimChunkingPass
     assert(generic_op && "no reduction linalg.generic in compute stage");
 
     // ------------------------------------------------------------------
-    // Determine reduction dims, num_chunks, and per-dim chunk sizes.
+    // Determine reduction dims and per-dim chunk sizes.
     //
-    // Threshold path (numChunks empty): only the outermost reduction dim is
-    // chunked.  If it is also the inner (rightmost input tensor) dim it belongs
-    // to the hardware SIMD path — skip chunking entirely.
+    // Threshold path (numChunks empty): GCD-based outer-to-inner chunking
+    // across all reduction dims; dynamic dims are skipped; the innermost
+    // overall loop dim is excluded if it is a reduction dim.
     //
-    // Explicit path (numChunks non-empty): multi-dim chunking — one value per
-    // reduction dim, nested scf.for loops, dims with count 1 produce no loop.
+    // Explicit path (numChunks non-empty): one value per reduction dim;
+    // nested scf.for loops; dims with count 1 produce no loop.
     // ------------------------------------------------------------------
     SmallVector<int64_t> reduction_dims;
     SmallVector<int64_t> chunk_sizes;
-    unsigned loop_num_chunks = 0;
 
     if (numChunks.empty()) {
-      // Auto-infer via analysis — outermost reduction dim only.
+      // Auto-infer via analysis — GCD-based outer-to-inner chunking.
 
-      // Locate the outermost reduction dim (first iterator typed `reduction`).
-      int64_t outermost_red_dim = -1;
+      // Collect all reduction dims, excluding the innermost overall loop dim
+      // if it is a reduction (the innermost loop dim must never be chunked,
+      // regardless of iterator type).
       {
         auto iter_types = generic_op.getIteratorTypesArray();
-        for (int64_t i = 0; i < static_cast<int64_t>(iter_types.size()); ++i) {
-          if (iter_types[i] == utils::IteratorType::reduction) {
-            outermost_red_dim = i;
-            break;
-          }
-        }
+        int64_t last = static_cast<int64_t>(iter_types.size()) - 1;
+        for (int64_t i = 0; i < static_cast<int64_t>(iter_types.size()); ++i)
+          if (iter_types[i] == utils::IteratorType::reduction && i != last)
+            reduction_dims.push_back(i);
       }
-      if (outermost_red_dim < 0) {
+      if (reduction_dims.empty()) {
         LDBG(1) << PASS_NAME
-            ": could not find a reduction dimension — skipping";
-        return success();
-      }
-
-      // If the outermost reduction dim is also the inner (rightmost input
-      // tensor) dim it belongs to the hardware SIMD path — skip entirely.
-      std::optional<unsigned> inner_dim = findInnerDimLoopDim(generic_op);
-      if (inner_dim && static_cast<int64_t>(*inner_dim) == outermost_red_dim) {
-        LDBG(1) << PASS_NAME << ": outermost reduction dim "
-                << outermost_red_dim
-                << " is the inner (rightmost input) dim — skipping chunking";
+            ": could not find a chunkable reduction dimension — skipping";
         return success();
       }
 
@@ -253,10 +244,25 @@ struct ReductionDimChunkingPass
                                  "chunk count");
         return failure();
       }
-      loop_num_chunks = result->num_chunks;
-      // Restrict to outermost dim only: take just the first entry.
-      reduction_dims = {outermost_red_dim};
-      chunk_sizes = {result->chunk_sizes[0]};
+
+      // Collect per-dim sizes in reduction-dim order, using kDynamic for
+      // dims whose size is unknown so computeChunkDims can skip them.
+      auto input_type =
+          cast<RankedTensorType>(generic_op.getInputs().front().getType());
+      SmallVector<int64_t> red_dim_sizes;
+      red_dim_sizes.reserve(reduction_dims.size());
+      for (int64_t d : reduction_dims)
+        red_dim_sizes.push_back(input_type.getDimSize(d));
+
+      auto chunk_dims = computeChunkDims(red_dim_sizes, result->num_chunks);
+      if (!chunk_dims) {
+        inner_pipeline.emitError(
+            PASS_NAME
+            ": chunk count could not be fully distributed across the "
+            "chunkable reduction dimensions");
+        return failure();
+      }
+      chunk_sizes = std::move(*chunk_dims);
     } else {
       // User-supplied --num-chunks path: collect reduction dims and validate.
       auto iter_types = generic_op.getIteratorTypesArray();
@@ -277,11 +283,6 @@ struct ReductionDimChunkingPass
             llvm::Twine(reduction_dims.size()) + " reduction dims");
         return failure();
       }
-
-      // loop_num_chunks is only used for the debug log below; the actual
-      // per-dim loops are driven by per_dim_num_chunks.
-      loop_num_chunks = 1;
-      for (unsigned nc : numChunks) loop_num_chunks *= nc;
 
       auto input_type =
           cast<RankedTensorType>(generic_op.getInputs().front().getType());
@@ -304,19 +305,27 @@ struct ReductionDimChunkingPass
       }
     }
 
-    LDBG(1) << PASS_NAME ": num_reduction_dims=" << reduction_dims.size()
-            << " total_chunks=" << loop_num_chunks;
-
     // Collect per-dim chunk counts in reduction-dim order.
     SmallVector<int64_t> per_dim_num_chunks;
     if (numChunks.empty()) {
-      // Auto-inferred path: only the outermost dim was kept, assign its count.
-      per_dim_num_chunks.assign(reduction_dims.size(),
-                                static_cast<int64_t>(loop_num_chunks));
+      // Auto-inferred path: derive per-dim count from dim_size / chunk_size.
+      auto input_type =
+          cast<RankedTensorType>(generic_op.getInputs().front().getType());
+      for (size_t j = 0; j < reduction_dims.size(); ++j) {
+        int64_t dim_size = input_type.getDimSize(reduction_dims[j]);
+        // Dynamic dims were skipped by computeChunkDims (chunk_sizes[j] left
+        // at kDynamic) — treat as 1 chunk (no loop emitted).
+        if (dim_size == ShapedType::kDynamic)
+          per_dim_num_chunks.push_back(1);
+        else
+          per_dim_num_chunks.push_back(dim_size / chunk_sizes[j]);
+      }
     } else {
       for (unsigned nc : numChunks)
         per_dim_num_chunks.push_back(static_cast<int64_t>(nc));
     }
+
+    LDBG(1) << PASS_NAME ": num_reduction_dims=" << reduction_dims.size();
 
     // One chunk on every dimension leaves the reduction as it is: the rewrite
     // below would rebuild the pipeline to emit the same program, differing only

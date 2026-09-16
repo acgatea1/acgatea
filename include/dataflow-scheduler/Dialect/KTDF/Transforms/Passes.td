@@ -269,9 +269,13 @@ def ReductionDimChunkingPass : Pass<"reduction-dim-chunking", "mlir::ModuleOp"> 
     ktdf.pipeline (Load / Compute / Store stages).
 
     When the chunk count is inferred from the threshold (num-chunks not
-    specified), only the outermost reduction dimension is chunked.  If that dimension is also the inner dim (the
-    rightmost input tensor dimension, belonging to the hardware SIMD path),
-    the pass skips chunking entirely.
+    specified), a GCD-based outer-to-inner strategy is used: starting from
+    the outermost reduction dimension, each step absorbs gcd(dim_size,
+    remaining_chunk) into that dimension and passes remaining/gcd inward.
+    Dimensions with a symbolic (dynamic) size are skipped without consuming
+    any of the remaining chunk budget.  The innermost overall loop dimension
+    is never chunked — if it is a reduction dim it is excluded before
+    distribution begins.
 
     When num-chunks is specified explicitly, multi-dim chunking is applied:
     one value per reduction dimension (in iterator-type order), one nested
@@ -310,10 +314,8 @@ def ReductionDimChunkingPass : Pass<"reduction-dim-chunking", "mlir::ModuleOp"> 
     the pass emits one nested scf.for per dim (dims with chunk count 1
     produce no loop).  When omitted (the default), the pass infers the
     chunk count automatically from the input tensor size and the
-    `chunk-size-threshold` option (outermost dim only): it picks the
-    smallest integer N ≥ 1 such that (total_input_bytes / N) ≤
-    chunk-size-threshold AND N evenly divides the outermost reduction
-    dimension size.
+    `chunk-size-threshold` option, then distributes it across dims using
+    the GCD-based outer-to-inner strategy described above.
 
     Option `chunk-size-threshold` (default 1 MiB = 1048576 bytes) is the
     per-chunk byte budget used when `num-chunks` is not provided.  It is
@@ -326,8 +328,8 @@ def ReductionDimChunkingPass : Pass<"reduction-dim-chunking", "mlir::ModuleOp"> 
                "per reduction dim, in iterator-type order).  Values may differ "
                "across dims; the pass emits one nested scf.for per dim (dims "
                "with chunk count 1 produce no loop).  When empty (the default) "
-               "the pass infers the chunk count from chunk-size-threshold "
-               "(outermost dim only).">,
+               "the pass infers the chunk count from chunk-size-threshold and "
+               "distributes it via the GCD-based outer-to-inner strategy.">,
     Option<"chunkSizeThreshold", "chunk-size-threshold", "int64_t",
            "1048576",
            "Per-chunk size budget in bytes used for automatic numChunks "
