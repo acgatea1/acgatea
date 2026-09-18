@@ -4,7 +4,7 @@
 //
 // Input linalg.generic over tensor<1x32768x64xf16>:
 //   iterator_types = ["parallel", "reduction", "parallel"]
-//   total_input_bytes = 2 * 32768 * 64 * 2 = 4,194,304 bytes (4 MiB)
+//   total_input_bytes = 1 * 32768 * 64 * 2 = 4,194,304 bytes (4 MiB)
 //
 // Default threshold = 1 MiB = 1,048,576 bytes.
 // Smallest N such that 4,194,304 / N ≤ 1,048,576 is N=4.
@@ -20,8 +20,8 @@
 // Each iteration processes tensor<1x8192x64xf16> (524288 elements).
 
 // CHECK-LABEL: func.func @local_schedule_0
-// CHECK:         arith.constant 4 : index
-// CHECK:         scf.for
+// CHECK:         %[[C4:.*]] = arith.constant 4 : index
+// CHECK:         scf.for {{.*}} to %[[C4]]
 // CHECK:           ktdf.read_from_fifo {{.*}} -> tensor<1x8192x64xf16>
 // CHECK:           linalg.generic
 // CHECK-SAME:        iterator_types = ["parallel", "reduction", "parallel"]
@@ -70,7 +70,6 @@ module {
         } {applicable_units = ["MNILU"]}
         ktdf.stage depends_in(%2#2) depends_out(%2#3) {
           scf.for %arg0 = %c0 to %c2 step %c1 {
-            // expected-error @below {{reduction-dim-chunking: chunk count could not be fully distributed before reaching the innermost dimension}}
             ktdf.pipeline {
               %3:4 = ktdf.private -> (!ktdf.fifo.slot<"L1LU" -> "SFU", 2097152xf16>, !ktdf.fifo.slot<"SFU" -> "L1SU", 64xf16>, !ktdf.token, !ktdf.token) {
                 %4 = ktdf.fifo.allocate() -> !ktdf.fifo.slot<"L1LU" -> "SFU", 2097152xf16>
