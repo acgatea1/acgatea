@@ -84,9 +84,13 @@
 // CHECK-NEXT:                   %[[ALLOC_2:.*]] = memref.alloc() : memref<1x64xf16, "SFU_REG">
 // CHECK-NEXT:                   %[[ALLOC_3:.*]] = memref.alloc() : memref<1x64xf16, "SFU_REG">
 // CHECK-NEXT:                   %[[CONSTANT_13:.*]] = arith.constant 0.000000e+00 : f16
-// CHECK-NEXT:                   linalg.fill ins(%[[CONSTANT_13]] : f16) outs(%[[ALLOC_2]] : memref<1x64xf16, "SFU_REG">)
+// CHECK-NEXT:                   %[[ALLOC_4:.*]] = memref.alloc() : memref<1x64xf16, "SFU_REG">
+// CHECK-NEXT:                   linalg.fill ins(%[[CONSTANT_13]] : f16) outs(%[[ALLOC_4]] : memref<1x64xf16, "SFU_REG">)
+// CHECK-NEXT:                   memref.copy %[[ALLOC_4]], %[[ALLOC_2]] : memref<1x64xf16, "SFU_REG"> to memref<1x64xf16, "SFU_REG">
 // CHECK-NEXT:                   %[[CONSTANT_14:.*]] = arith.constant 0.000000e+00 : f16
-// CHECK-NEXT:                   linalg.fill ins(%[[CONSTANT_14]] : f16) outs(%[[ALLOC_3]] : memref<1x64xf16, "SFU_REG">)
+// CHECK-NEXT:                   %[[ALLOC_5:.*]] = memref.alloc() : memref<1x64xf16, "SFU_REG">
+// CHECK-NEXT:                   linalg.fill ins(%[[CONSTANT_14]] : f16) outs(%[[ALLOC_5]] : memref<1x64xf16, "SFU_REG">)
+// CHECK-NEXT:                   memref.copy %[[ALLOC_5]], %[[ALLOC_3]] : memref<1x64xf16, "SFU_REG"> to memref<1x64xf16, "SFU_REG">
 // CHECK-NEXT:                   %[[CONSTANT_15:.*]] = arith.constant 64 : index
 // CHECK-NEXT:                   scf.for %[[VAL_8:.*]] = %[[CONSTANT_7]] to %[[CONSTANT_15]] step %[[CONSTANT_8]] {
 // CHECK-NEXT:                     %[[READ_FROM_FIFO_0:.*]] = ktdf.read_from_fifo %[[VAL_7]]#0 : <"L1LU" -> "SFU", 64xf16> -> memref<1x1x64xf16>
